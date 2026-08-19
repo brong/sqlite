@@ -1,0 +1,124 @@
+source: 4e8a374
+date: 2026-08-19 (library 2.8.0, and 2.7.0/2.6.0 with it.
+
+      A LARGE ROLLOVER IS NO LONGER PUNISHED BY THE PRIVATE INDEX (2.8.0).
+      Each delta->base merge in the active file's in-memory index is
+      O(nbase) with a record decode per comparison, and it ran once per
+      fixed 1024 inserts, so a generation of N records cost N/1024 merges
+      of O(N) -- quadratic in rollover_size.  The bound is now
+      max(1024, nbase/32).  This is the fix for the anomaly this port
+      reported for four libraries: "64MB is the worst setting while
+      rewriting a quarter of the bytes."  Confirmed here interleaved, 2M
+      records at 1000-per-txn, three passes per arm: 64MB ascending
+      894-986k/s -> 1.73-1.82M/s (+92%), 64MB random 138-140k -> 217-220k
+      (+58%), and the 2MB default inert on both orders (ranges overlap).
+      64MB goes from 0.71x of the default to 1.33x, so the ranking inverts.
+      No API or format change; nothing in this engine had to move.
+
+      CONFIRMED ON PRODUCTION (2026-08-19, stl-imap-09, ZFS), 2M records at
+      1000-per-txn: 64MB ascending 8.07s -> 5.16s at 4K (+56%) and 7.70s ->
+      4.70s at 128K (+64%).  64MB is now the BEST rollover on both
+      recordsizes, beating the previous champion (16MB + deferred cascade),
+      and the sweep is monotonic for the first time.  Deployment note for us:
+      D-9d's 1024-span bound makes rollover_size inert for a per-message
+      writer, so this is a bulk-load setting, not a steady-state one.
+
+      Also 2.7.0, and 2.6.0 with it.
+
+      ONE GATE PER COMMIT (2.6.0, C-7): the sync between a span's records
+      and its terminator is gone, because the terminator's checksum already
+      makes a terminator that reaches disk without its data read as absent
+      (F-22).  Confirmed here interleaved at 20k records, durable: 1-per-txn
+      22.3-22.6k/s -> 39.0k/s (+73%, upstream measures +81%), 1000-per-txn
+      2.42-2.55M -> 2.65-2.76M (+8%, upstream +11%).
+
+      CONFIRMED ON PRODUCTION (2026-08-19, stl-imap-09, ZFS): durable
+      1-per-txn 5486/s -> 10203/s at 4K (+86%) and 5017 -> 9880 at 128K
+      (+97%), against a control that says the attribution is clean -- that
+      row was flat on 2.2.0 and 2.5.0 (5486 -> 5507).  I had predicted 6-7%
+      from an strace figure that was SYSTEM time, not latency; the gate is
+      86us of wall, of which 12us is CPU, and one 86us gate predicts all four
+      transaction sizes and both table shapes.  Upstream was right that a
+      real ZIL commit shows it best.
+
+      C-7a, which required an engine change: a failed commit is now an
+      UNKNOWN outcome, never "it did not happen".  Our
+      sqlite3BtreeCommitPhaseTwo inherited the old two-gate assumption by
+      leaving iDataVersion alone on error; it now bumps the data version and
+      drops the meta cache, so the connection re-reads rather than trusting
+      caches built before an outcome it cannot determine.  We do not retry
+      the sync -- C-7a forbids reading a second success as evidence.
+
+      The append buffer grows on demand, 64KB to 4MB (2.6.0), so a
+      1000-record transaction now stays buffered and is written once with
+      its terminator.  Several "64KB chunk" statements in the doc are
+      qualified accordingly.
+
+      AN ABORT WITH NOTHING IN THE FILE WRITES NOTHING (2.7.0, C-8b).
+      Verified through SQL both sides of the boundary: 300 transactions of
+      10 inserted-then-rolled-back rows leave the active file byte-identical
+      at 432 bytes, while one rollback of 60000 rows (6.6MB, past the
+      ceiling) writes its span and voids it correctly (count 1,
+      integrity_check ok).  A rolled-back span is therefore no longer
+      something a conforming writer can be required to produce; reading one
+      remains mandatory (F-21, F-25) and our reader side is unchanged.  Also
+      fixes a latent bug: a failed flush inside zsi_txn_at used to leave a
+      transaction committable over a possibly-torn span, and now poisons it.
+
+      Also 2.5.0.  A COMMIT NO LONGER PUBLISHES a pointer
+      table (P-13): publishing amortises a replay and the commit path folds
+      rather than replaying, so a table written there cost the writer and
+      bought it nothing.  Tables still appear, published by whoever built an
+      index by replaying -- including the same writer at its own next open.
+      Confirmed here, interleaved: a cached 2M-record load at 1000-per-txn
+      goes 1.86-1.95s -> 1.47-1.53s (-21%, upstream measures 22%) and is now
+      LEVEL with no cache at all, so the table's write-side cost has
+      essentially gone at the default rollover.
+
+      One caller-facing consequence upstream flagged: a writer no longer
+      moves its own replay window, so with a cache configured rollover_txns
+      governs exactly as it does without one.  A 200k-record load at ONE
+      record per transaction goes from 12 conversions to 195 and 4 repacks to
+      65 -- much more file lifecycle -- and is still faster here (10.06s ->
+      8.86s durable, 1.72s -> 1.42s nosync).  On ZFS, where unlink costs
+      1.8ms against nothing on APFS, that sign could flip; prodrun.sh's
+      `cached` phase measures it rather than assuming.
+
+      Also 2.4.0.  A read-only handle now CREATES the
+      ZS_INDEX_LOCAL cache directory instead of running uncached when it is
+      absent (P-2b, R-3).  It could always publish into that directory, so
+      refusing only the creation meant enabling zs_index=local on a
+      read-mostly database did nothing until an unrelated write came along --
+      which is the deployment shape we care about, and it silently invalidated
+      the open-side half of our break-even calculation.  Verified end to end:
+      a cold import leaves no cache, one read-only open leaves
+      zeroskip.cache/zeroskip.index-<uuid>-<gen> for the active generation.
+      A read-only MOUNT is unaffected; creation fails and the handle continues
+      uncached.
+
+      Also 2.3.0.  One code change since 2.2.1: the default
+      pointer-table publish threshold now scales with the file it describes
+      instead of being an absolute 32KB (A-9).  That absolute value made a
+      large generation publish ~2000 times whatever its size, each publish
+      rewriting a table proportional to the whole generation -- quadratic
+      in generation size, 4.70GB of table writes at a 64MB rollover.
+      It also left a small database with a large rollover barely
+      publishing and paying for it at every open.  A caller passing a
+      non-zero index_threshold is unaffected; we do not.
+
+      This retires a conclusion recorded here: the -42%/-71% cost of the
+      pointer table at 16MB/64MB rollover was that default, not evidence
+      against pairing a large generation with the table.  Confirmed
+      interleaved at 2M records, 1000-per-txn: 64MB + table 4.57-6.29s on
+      2.2.1 -> 2.63s on 2.3.0.)
+files: zeroskip.c zeroskip.h xxhash.h zsbench.c
+reverse-api: ZS_REVERSE ZS_FETCHPREV (ZS_FETCHNEXT inclusive-GE)
+open-data: ZS_OPEN_DATA_INITIALIZER gained a field for repack_max_size in
+      2.1.1.  We use the initializer rather than a field list, so a new
+      field arrives defaulted; keep it that way.
+stats: sqlite3ZsStats() in btree_zs.h exposes zs_db_stats (A-17), so a
+      benchmark run reports its own write amplification.
+repack: ZS_NOAUTOREPACK is reachable as the URI parameter zs_norepack=1,
+      with sqlite3ZsRepackCatchUp() to finish the job from idle time.
+      zs_rollover=BYTES sets the generation size; rollover_txns is left at
+      the library default deliberately (see zsbtEnsureOpen).
