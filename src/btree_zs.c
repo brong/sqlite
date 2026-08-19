@@ -2498,26 +2498,38 @@ struct zs_db *sqlite3ZsBtreeDb(Btree *p){
   return p->pZs;
 }
 
-/* Run the repack cascade to completion from idle time, for a handle opened
-** with zs_norepack.  Safe to call on any handle: with the cascade armed
+/* Run the repack cascade from idle time, for a handle opened with
+** zs_norepack.  Safe to call on any handle: with the cascade armed
 ** should_repack is normally false, so this is a no-op rather than an error.
-** Must not be called inside a transaction -- a merge takes the write lock. */
-int sqlite3ZsRepackCatchUp(sqlite3 *db, const char *zDb, int *pnMerges){
+** Must not be called inside a transaction -- a merge takes the write lock.
+**
+** Bounded because the intended caller is a post-response delayed-work slot,
+** not a benchmark: one merge rewrites a whole generation and cannot be
+** interrupted, so "catch up completely" is the wrong contract for anything
+** with a latency budget.  See btree_zs.h for why *pbBehind is part of the
+** interface rather than left to the caller to re-derive. */
+int sqlite3ZsRepackCatchUp(sqlite3 *db, const char *zDb, int nMaxMerges,
+                           int *pnMerges, int *pbBehind){
   struct zs_db *pZs;
   int iDb, n = 0;
 
   if( pnMerges ) *pnMerges = 0;
+  if( pbBehind ) *pbBehind = 0;
   iDb = zDb ? sqlite3FindDbName(db, zDb) : 0;
   if( iDb<0 || db->aDb[iDb].pBt==0 ) return SQLITE_ERROR;
   pZs = sqlite3ZsBtreeDb(db->aDb[iDb].pBt);
   if( pZs==0 ) return SQLITE_ERROR;
-  while( zs_db_should_repack(pZs) ){
+  /* An unbounded call still gets a backstop, because a cascade that will not
+  ** converge is a bug in either layer and an infinite loop is a worse way to
+  ** report it than a wrong count. */
+  if( nMaxMerges<=0 ) nMaxMerges = 1000;
+  while( n<nMaxMerges && zs_db_should_repack(pZs) ){
     int zrc = zs_db_repack(pZs);
     if( zrc!=ZS_OK ) return zsbtErr(zrc);
     n++;
-    if( n>1000 ) break;          /* a cascade that will not converge */
   }
   if( pnMerges ) *pnMerges = n;
+  if( pbBehind ) *pbBehind = zs_db_should_repack(pZs) ? 1 : 0;
   return SQLITE_OK;
 }
 

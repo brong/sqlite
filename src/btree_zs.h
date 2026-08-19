@@ -41,9 +41,25 @@ void sqlite3ZsBtreeScheduleCompact(Btree *p);
 int sqlite3ZsStats(sqlite3 *db, const char *zDb,
                    sqlite3_uint64 *aOut, int nOut);
 
-/* Drive the repack cascade to completion, for a handle opened with
-** zs_norepack=1 (which keeps it off the write path).  Not inside a
-** transaction.  *pnMerges, if given, receives the number of merges run. */
-int sqlite3ZsRepackCatchUp(sqlite3 *db, const char *zDb, int *pnMerges);
+/* Drive the repack cascade from outside the write path, for a handle opened
+** with zs_norepack=1.  Not inside a transaction -- a merge takes the write
+** lock.
+**
+** nMaxMerges bounds the work: at most that many merges, or unbounded when it
+** is <=0.  A caller with a latency budget wants a small bound, because a
+** merge's cost is a whole generation and it cannot be interrupted once
+** started -- an unbounded call can stall a worker for seconds on a database
+** that has fallen behind.  That is the shape a delayed-work slot needs, and
+** the reason this is not simply a loop the caller could write: without
+** *pbBehind it cannot tell "done" from "gave up early".
+**
+** *pnMerges, if given, receives the number of merges run.  *pbBehind, if
+** given, receives true when more merges remain -- so a caller can schedule
+** itself again rather than guess.  Never disarm and never ignore *pbBehind:
+** point-lookup cost is linear in the file count (D-14d), and a 2M-record load
+** left un-repacked leaves 119 files and takes readdir from 6,378 calls to
+** 29,723. */
+int sqlite3ZsRepackCatchUp(sqlite3 *db, const char *zDb, int nMaxMerges,
+                           int *pnMerges, int *pbBehind);
 
 #endif /* SQLITE_BTREE_ZS_H */

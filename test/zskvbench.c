@@ -188,7 +188,7 @@ static void insert_n(sqlite3 *db, char *val, int per){
 ** nothing to report. */
 #ifdef SQLITE_ZEROSKIP
 extern int sqlite3ZsStats(sqlite3*, const char*, sqlite3_uint64*, int);
-extern int sqlite3ZsRepackCatchUp(sqlite3*, const char*, int*);
+extern int sqlite3ZsRepackCatchUp(sqlite3*, const char*, int, int*, int*);
 static int grab_rewrites(sqlite3 *db, sqlite3_uint64 *a){
   return sqlite3ZsStats(db, 0, a, 8)==SQLITE_OK;
 }
@@ -203,7 +203,7 @@ static double catch_up(sqlite3 *db, int *pnMerges){
   double dt;
   sqlite3_stmt *pChk;
   const unsigned char *z;
-  if( sqlite3ZsRepackCatchUp(db, 0, pnMerges)!=SQLITE_OK ){
+  if( sqlite3ZsRepackCatchUp(db, 0, 0, pnMerges, 0)!=SQLITE_OK ){
     fprintf(stderr, "catch-up failed\n");
     exit(1);
   }
@@ -243,6 +243,149 @@ static void print_rewrites(const sqlite3_uint64 *a, double stored){
          (unsigned long long)a[4], (double)a[6]/1e6, (double)a[7]/1e6,
          (unsigned long long)a[0], (double)a[2]/1e6, (double)a[3]/1e6,
          stored/1e6);
+}
+
+/* --latency: the per-message shape, reported as a DISTRIBUTION.
+**
+** Every other store row here is a rate, and a rate cannot answer the question
+** a mail server actually has.  Deliveries commit one message at a time, and
+** the repack cascade runs synchronously inside whichever write transaction
+** happens to trip it -- so one delivery in N pays for a whole generation merge
+** while the rest pay nothing.  A mean hides that completely: it is a tail
+** problem, and whether to move repacks off the critical path is a decision
+** about the tail.
+**
+** So this times each commit separately and reports percentiles, and it
+** ATTRIBUTES the outliers rather than assuming they are repacks: the library's
+** repack and conversion counters (A-17) are sampled either side of every
+** commit, so a commit that merged is known to have merged.  Without that the
+** slow tail could equally be ZFS txg boundaries or the append buffer growing,
+** and the fix for each is different.
+**
+** Pair it with zs_norepack=1 to see the same distribution with the cascade off
+** the write path -- that difference is what a background repack would buy, and
+** it is the number to have before adding a thread to a process that has none. */
+static int nLatency = 0;           /* --latency N: N single-record commits */
+
+static int cmp_double(const void *a, const void *b){
+  double x = *(const double*)a, y = *(const double*)b;
+  return x<y ? -1 : (x>y ? 1 : 0);
+}
+static double pct(const double *aSorted, int n, double p){
+  double idx;
+  if( n<=0 ) return 0.0;
+  idx = p*(n-1)/100.0;
+  return aSorted[(int)(idx+0.5)];
+}
+
+static void bench_latency(int n){
+  sqlite3 *db;
+  sqlite3_stmt *pIns;
+  double *aAll, *aRepack, *aPlain;
+  sqlite3_uint64 aBefore[8], aAfter[8];
+  int i, nRepack = 0, nPlain = 0, bStats;
+  double tTotal = 0.0;
+  char *val;
+
+  aAll    = sqlite3_malloc64((sqlite3_int64)n*sizeof(double));
+  aRepack = sqlite3_malloc64((sqlite3_int64)n*sizeof(double));
+  aPlain  = sqlite3_malloc64((sqlite3_int64)n*sizeof(double));
+  if( aAll==0 || aRepack==0 || aPlain==0 ){
+    fprintf(stderr, "out of memory for %d samples\n", n);
+    exit(1);
+  }
+  /* Hoisted out of the loop deliberately: a malloc and a memset per commit is
+  ** noise injected into the exact quantity being measured, and at a p50 of
+  ** ~24us it is not a small fraction of it. */
+  val = sqlite3_malloc64((sqlite3_int64)valsize);
+  if( val==0 ){ fprintf(stderr, "oom\n"); exit(1); }
+  memset(val, 'x', valsize);
+  cleanup(workdir);
+  db = open_fresh(workdir);
+  if( sqlite3_prepare_v2(db, "INSERT INTO kv VALUES(?1,?2)", -1, &pIns, 0)
+        !=SQLITE_OK ){
+    fprintf(stderr, "prepare: %s\n", sqlite3_errmsg(db));
+    exit(1);
+  }
+  bStats = grab_rewrites(db, aBefore);
+  perm_reset();
+  for(i=0; i<n; i++){
+    char k[32];
+    int key = bRandom ? perm_next() : i;
+    double t0, dt;
+    if( bRowid ){
+      sqlite3_bind_int64(pIns, 1, (sqlite3_int64)key + 1);
+    }else{
+      snprintf(k, sizeof(k), "key%08d", key);
+      sqlite3_bind_text(pIns, 1, k, -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_blob(pIns, 2, val, (int)valsize, SQLITE_STATIC);
+    /* One implicit transaction per step: this is the shape being measured,
+    ** so no BEGIN/COMMIT around it. */
+    t0 = now();
+    if( sqlite3_step(pIns)!=SQLITE_DONE ){
+      fprintf(stderr, "insert: %s\n", sqlite3_errmsg(db));
+      exit(1);
+    }
+    dt = now() - t0;
+    sqlite3_reset(pIns);
+    aAll[i] = dt;
+    tTotal += dt;
+    if( bStats && grab_rewrites(db, aAfter) ){
+      /* aOut[0] repacks, aOut[4] conversions -- either one means this commit
+      ** did file-lifecycle work the next one will not. */
+      if( aAfter[0]!=aBefore[0] || aAfter[4]!=aBefore[4] ){
+        aRepack[nRepack++] = dt;
+      }else{
+        aPlain[nPlain++] = dt;
+      }
+      memcpy(aBefore, aAfter, sizeof(aBefore));
+    }else{
+      aPlain[nPlain++] = dt;
+    }
+  }
+  sqlite3_finalize(pIns);
+
+  qsort(aAll, n, sizeof(double), cmp_double);
+  printf("  %-34s%7.0f/s  %5.2fs\n", "commit, one record each",
+         n/tTotal, tTotal);
+  printf("  %-34sp50 %7.3f  p90 %7.3f  p99 %7.3f  p99.9 %7.3f  max %7.3f ms\n",
+         "latency", pct(aAll,n,50)*1e3, pct(aAll,n,90)*1e3,
+         pct(aAll,n,99)*1e3, pct(aAll,n,99.9)*1e3, aAll[n-1]*1e3);
+  if( nRepack>0 || nPlain>0 ){
+    qsort(aRepack, nRepack, sizeof(double), cmp_double);
+    qsort(aPlain, nPlain, sizeof(double), cmp_double);
+    /* The split is the point: if the tail is NOT the merging commits, moving
+    ** repacks off the write path will not fix it. */
+    if( nRepack>0 ){
+      double tRepack = 0.0;
+      int j;
+      for(j=0; j<nRepack; j++) tRepack += aRepack[j];
+      /* The share of total time is what decides whether backgrounding is
+      ** worth anything: a 0.5%% of commits holding 30%% of the time is a tail
+      ** worth moving, the same 0.5%% holding 1%% is not. */
+      printf("  %-34s%d of %d commits (%.2f%%)  p50 %7.3f  max %7.3f ms"
+             "  = %.0f%% of total time\n",
+             "  merged", nRepack, n, 100.0*nRepack/n,
+             pct(aRepack,nRepack,50)*1e3, aRepack[nRepack-1]*1e3,
+             tTotal>0 ? 100.0*tRepack/tTotal : 0.0);
+    }else{
+      printf("  %-34snone -- the tail is not merging, look elsewhere\n",
+             "  merged");
+    }
+    if( nPlain>0 ){
+      printf("  %-34s%d commits            p50 %7.3f  p99 %7.3f  max %7.3f ms\n",
+             "  did not merge", nPlain, pct(aPlain,nPlain,50)*1e3,
+             pct(aPlain,nPlain,99)*1e3, aPlain[nPlain-1]*1e3);
+    }
+  }
+  if( bStats && grab_rewrites(db, aAfter) ){
+    print_rewrites(aAfter, (double)n * (double)(11 + valsize));
+  }
+  sqlite3_close(db);
+  cleanup(workdir);
+  sqlite3_free(val);
+  sqlite3_free(aAll); sqlite3_free(aRepack); sqlite3_free(aPlain);
 }
 
 static void bench_store(int per){
@@ -454,6 +597,11 @@ int main(int argc, char **argv){
       zInit = argv[++i];
     }else if( !strcmp(argv[i], "--uri") && i+1<argc ){
       zUri = argv[++i];
+    }else if( !strcmp(argv[i], "--latency") && i+1<argc ){
+      nLatency = atoi(argv[++i]);
+      reps = 1;                  /* a distribution over one pass; "best of N"
+                                 ** is meaningless here and the header would
+                                 ** otherwise say it */
     }else if( !strcmp(argv[i], "--random") ){
       bRandom = 1;
     }else if( !strcmp(argv[i], "--rowid") ){
@@ -473,8 +621,9 @@ int main(int argc, char **argv){
     }else{
       fprintf(stderr, "usage: zskvbench [--dir PATH] [-n N] [--value N]"
                       " [--reps N] [--init SQL] [--uri PARAMS] [--vacuum]"
-                      " [--only N] [--defer-repack] [--opens N]"
-                      " [--build-uri PARAMS] [--opens-per N]\n");
+                      " [--rowid] [--random] [--only N] [--defer-repack]"
+                      " [--opens N] [--build-uri PARAMS] [--opens-per N]"
+                      " [--latency N]\n");
       return 2;
     }
   }
@@ -499,7 +648,9 @@ int main(int argc, char **argv){
   ** enough for the repack cascade to matter -- which is where the rewrite
   ** counters get interesting -- the 1-per-txn row alone is 2 million
   ** commits, so a full sweep is not the way to ask that question. */
-  if( nOpens>0 ){
+  if( nLatency>0 ){
+    bench_latency(nLatency);
+  }else if( nOpens>0 ){
     bench_opens(nOpens);
   }else if( zOnly ){
     bench_store(atoi(zOnly));

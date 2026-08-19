@@ -39,7 +39,7 @@ NMID=${NMID:-200000}
 IDXDIR=${IDXDIR:-/tmpfs/zsidx}
 # PHASES lets a phase be re-run on its own -- phase 3 in particular, which
 # needs privilege and so wants an interactive shell for sudo.
-PHASES=${PHASES:-matrix cascade cached opens syscalls fsync}
+PHASES=${PHASES:-matrix cascade cached opens latency syscalls fsync}
 has_phase(){ case " $PHASES " in *" $1 "*) return 0;; *) return 1;; esac; }
 
 [ $# -ge 1 ] || { echo "usage: $0 DATASET_MOUNTPOINT [MORE...]" >&2; exit 2; }
@@ -55,6 +55,14 @@ say(){ echo; echo "=== $*"; }
 SUDO=""
 STRACE_OK=0
 cleanup(){ rm -rf "$1" 2>/dev/null || ${SUDO:-} rm -rf "$1"; }
+# A dataset's REAL recordsize, not the one its mountpoint is named for.  A run
+# was wasted on /mnt/bench128k created at 4K, and the fsync phase's per-block
+# reading is meaningless without it.  Prints "?" off ZFS rather than failing.
+dataset_recordsize(){
+  ds=$(df --output=source "$1" 2>/dev/null | tail -1)
+  zfs get -H -o value recordsize "$ds" 2>/dev/null || echo '?'
+}
+
 probe_strace(){
   [ $STRACE_OK -eq 1 ] && return 0
   if ! command -v strace >/dev/null 2>&1; then
@@ -328,6 +336,41 @@ done > "$OUT/opens.txt" 2>&1
 grep -E "^--|open\+first-read" "$OUT/opens.txt" | sed 's/^/  /'
 fi
 
+# -------------------------------------------------------------------- latency
+if has_phase latency; then
+say "phase: commit latency DISTRIBUTION at the per-message shape"
+# WHY: every other store row in this tier is a rate, and a rate cannot answer
+# the question the deployment actually has.  Cyrus commits one message at a
+# time, and the repack cascade runs synchronously inside whichever write
+# transaction trips it -- so one delivery in N pays for a whole generation
+# merge while the rest pay nothing.  That is a tail problem and a mean hides
+# it completely.
+#
+# The armed/norepack pair is the measurement that decides whether moving
+# repacks off the critical path is worth anything: it prices exactly what a
+# background repack would remove.  On the laptop it removes the max (2.2ms ->
+# 0.8ms) and almost nothing else, because 19 of the 25 slow commits are
+# CONVERSIONS, which zs_norepack does not disarm and which cannot be deferred
+# -- a generation has to be sealed into sorted form by someone.  Whether ZFS
+# agrees is the point of running it here: unlink costs ~1ms on this pool
+# against nothing on APFS, and the cascade does a lot of them.
+#
+# n is deliberately large enough for the cascade to run, and the run is one
+# pass (a distribution, not a best-of).
+{
+for d in "$@"; do
+  for cfg in "armed:" "norepack:zs_norepack=1"; do
+    lbl=${cfg%%:*}; uri=${cfg#*:}
+    w="$d/lat"; cleanup "$w"; mkdir -p "$w"
+    echo "-- $d cascade $lbl (recordsize $(dataset_recordsize "$d"))"
+    ./zskvbench --dir "$w" --latency "$NMID" --rowid ${uri:+--uri "$uri"}
+    cleanup "$w"
+  done
+done
+} > "$OUT/latency.txt" 2>&1
+grep -E "^--|latency|merged|did not merge|rewritten" "$OUT/latency.txt" | sed 's/^/  /'
+fi
+
 # ------------------------------------------------------------------- syscalls
 if has_phase syscalls; then
 say "phase 3/3: syscalls and profile"
@@ -422,38 +465,49 @@ say "phase: per-fsync cost against per-commit append size"
 # because `strace -c` summarises system time unless you pass -w.  Both call
 # sites now pass it.  A blocking fdatasync sleeps, and sleeping is not system
 # time, so this phase reported 12us for a gate whose real latency is 86us and
-# I built a prediction on it.  The wall/system split is the interesting part
-# and is now measurable directly: 14% CPU at a 111-byte span, 74% CPU at a
-# 111KB one, i.e. large spans are paying zstd+aes-256-gcm synchronously inside
-# fdatasync.  Cross-check any number here against the paired durable/nosync
-# matrix rows, which measure wall time by construction.
+# I built a prediction on it.  Cross-check any number here against the paired
+# durable/nosync matrix rows, which measure wall time by construction.
+#
+# RESULT (2026-08-19, later): in wall time there is no per-byte DEFICIT at all
+# -- we are cheaper per fdatasync than stock at every transaction size, because
+# the ~125us ZIL floor is shared and stock pays it 4x per commit against our 1x.
+# The CPU asymmetry that remains is NOT crypto: a call graph puts our
+# fdatasync's CPU in zio_create (alloc+memset), taskq dispatch and wakeup,
+# zfs_zget and the rangelock, with zio_compress_select at 0.03% and zstd/aes
+# absent.  ZIO_STAGE_ISSUE_ASYNC precedes ZIO_STAGE_WRITE_COMPRESS, so both
+# engines' crypto is on a z_wr_iss taskq.
+#
+# So the live question is per-BLOCK cost, not per-byte: a 130KB span is ~32
+# blocks at recordsize=4K and one or two at 128K, which should mostly flatten
+# the slope.  This phase therefore sweeps EVERY dataset it was given, not just
+# the first -- it ran on $1 alone for three rounds and could not have seen it.
 probe_strace
 if [ $STRACE_OK -ne 1 ]; then
   echo "  SKIPPED: needs strace"
 else
 echo "  zfs_immediate_write_sz: $(cat /sys/module/zfs/parameters/zfs_immediate_write_sz 2>/dev/null || echo '(unreadable)')"
-echo "  (decisive follow-up, no code change: raise it to 1M and the zeroskip"
-echo "   rows should collapse toward stock's if the threshold is the mechanism)"
-d1=${1}
-for per in 1 10 100 200 400 1000; do
-  case $per in
-    1) n=$N ;;
-    *) n=$NMID ;;
-  esac
-  for eng in zs stock; do
-    case $eng in
-      zs)    bin=./zskvbench ;;
-      stock) bin=./zskvbenchstock ;;
+for d1 in "$@"; do
+  echo "-- $d1 (recordsize $(dataset_recordsize "$d1"))"
+  for per in 1 10 100 200 400 1000; do
+    case $per in
+      1) n=$N ;;
+      *) n=$NMID ;;
     esac
-    w="$d1/fs-$eng-$per"
-    cleanup "$w"; mkdir -p "$w"
-    f="$OUT/fsync-$eng-$per.txt"
-    $SUDO strace -c -w -f -o "$f" \
-      $bin --dir "$w" -n "$n" --reps 1 --rowid --only $per >/dev/null 2>&1
-    line=$(grep -E "[[:space:]]fdatasync$" "$f" 2>/dev/null | head -1)
-    printf "  %-5s per=%-5s append=%-8s %s\n" "$eng" "$per" \
-      "$((per*111))B" "$(echo "$line" | awk '{printf "%s calls, %s us/call", $4, $3}')"
-    cleanup "$w"
+    for eng in zs stock; do
+      case $eng in
+        zs)    bin=./zskvbench ;;
+        stock) bin=./zskvbenchstock ;;
+      esac
+      w="$d1/fs-$eng-$per"
+      cleanup "$w"; mkdir -p "$w"
+      f="$OUT/fsync-$(basename "$d1")-$eng-$per.txt"
+      $SUDO strace -c -w -f -o "$f" \
+        $bin --dir "$w" -n "$n" --reps 1 --rowid --only $per >/dev/null 2>&1
+      line=$(grep -E "[[:space:]]fdatasync$" "$f" 2>/dev/null | head -1)
+      printf "  %-5s per=%-5s append=%-8s %s\n" "$eng" "$per" \
+        "$((per*111))B" "$(echo "$line" | awk '{printf "%s calls, %s us/call", $4, $3}')"
+      cleanup "$w"
+    done
   done
 done
 fi

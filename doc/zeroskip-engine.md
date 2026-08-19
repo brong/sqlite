@@ -621,9 +621,11 @@ inside syscalls altogether.  The 2026-08-19 run adds stock's half of the
 picture, which had never been profiled: stock's 46.0% of cycles under
 `do_syscall_64` is `__x64_sys_pwrite64` -> `vfs_write` -> `zfs_write` ->
 `dmu_assign_arcbuf_by_dnode`, i.e. buffered, with the compression and
-encryption deferred to a txg on another thread.  So the 13x is not a ZIL mode
-difference; it is that a large synchronous append pays for its own
-zstd+aes-256-gcm inline and a 4K journal overwrite does not.
+encryption deferred to a txg.  **The reason for the 13x was got wrong here
+three times and a call graph settled it on 2026-08-19: it is neither a ZIL mode
+difference nor inline crypto.** See "What our fdatasync actually spends its CPU
+on" below -- there is no compression, encryption or checksum in the caller's
+stack at all, and what is there is per-BLOCK setup.
 
 **On the three calls upstream offered to remove: not worth it, and the
 reason corrects a mistake this section first made.** `newfstatat` is 0.28%
@@ -700,14 +702,46 @@ once.**  Per byte the slopes are 3.74us/KB for us against 2.82 for stock, a
 factor of 1.33 -- not the "9x per synced byte" this document reported for three
 rounds.
 
-Why system time said otherwise, and it is not a subtlety: **stock's compression
-and encryption are deferred to a txg on another thread, so they never appear in
-stock's system time, while ours happen inline in the committing thread and do.**
-Measuring CPU therefore flattered stock by exactly the amount of work it had
-postponed.  In wall time both engines wait for the same pool, and the crypto
-asymmetry shows up as a slope difference of a third rather than a factor of
-nine.  It is still real -- our large `fdatasync` is about half CPU (312us system
-of 611us wall) against stock's 6% -- it is just not what governs.
+Why system time said otherwise: our `fdatasync` burns CPU in the committing
+thread that stock's does not -- about half its wall time (312us system of
+611us) against stock's 6%.  That asymmetry is measured and stands.  **What it
+is made of took three wrong answers, and it is not compression and
+encryption, which is what this document claimed here until the call graph
+arrived.**
+
+#### What our fdatasync actually spends its CPU on
+
+Not crypto.  A call graph of the same 2M-record load (`perf record -g`, process
+only, 4K dataset) puts `fdatasync` at 8.59% of cycles and names 73% of it:
+
+    zio_create (kmem alloc + memset_orig)           2.06%   24% of fdatasync
+    taskq_dispatch_ent -> __wake_up -> try_to_wake  1.70%   20%
+    zfs_zget                                        1.06%   12%
+    zfs_rangelock_enter_impl                        0.86%   10%
+    dmu_buf_hold_noread                             0.62%    7%
+
+Allocate a zio and zero it, take a rangelock, look up the znode, hand off to a
+taskq and wake it.  `zio_compress_select` is 0.03% of the whole profile and
+`zio_checksum_select` 0.01%; zstd, aes and gcm do not appear at all.
+
+`zio_nowait -> zio_issue_async -> taskq_dispatch_ent` at 1.70% is the handoff
+itself, which is the direct evidence: `ZIO_STAGE_ISSUE_ASYNC` precedes
+`ZIO_STAGE_WRITE_COMPRESS` in the write pipeline, so the caller dispatches and
+never runs the compress or encrypt stage.  Both engines' crypto is on a
+`z_wr_iss` taskq thread.  ZFS spawns nothing per write, either: the ZIO taskqs
+and the per-pool `txg_sync_thread` are created at pool import and parked.
+
+**That predicts something this sweep had not tested.** If the cost is
+per-BLOCK setup rather than per-byte work, a 130KB span is ~32 blocks at
+`recordsize=4K` and one or two at 128K, so the per-KB slope should mostly
+flatten at 128K.  The fsync phase now sweeps both datasets rather than only
+the first, because asserting this instead of measuring it is the exact mistake
+this section documents three times over.
+
+Caveat on the profile, in both directions: `perf record` on the process sampled
+only `zskvbench` (98.13% of cycles), so it proves the crypto is not in OUR
+thread and says nothing about what the taskqs cost.  `perf record -a` is what
+would price those.
 
 **So the matrix crossover has a different cause, and it is one we can act on.**
 At 1000 records per transaction we lose the store row to the btree while being
@@ -814,9 +848,14 @@ the armed one (2 against 5), because the cascade stops mid-ladder while a
 catch-up runs to completion.
 
 `zs_norepack=1` on the URI opens with `ZS_NOAUTOREPACK`, and
-`sqlite3ZsRepackCatchUp()` (btree_zs.h) drives `zs_db_repack` until
-`zs_db_should_repack` is false.  `zskvbench --defer-repack` composes the two
-and times them apart.
+`sqlite3ZsRepackCatchUp(db, zDb, nMaxMerges, &nDone, &bBehind)` (btree_zs.h)
+drives `zs_db_repack`, bounded to `nMaxMerges` or unbounded at 0.  It is
+bounded because the intended caller is a post-response delayed-work slot rather
+than a benchmark: one merge rewrites a whole generation and cannot be
+interrupted, so "catch up completely" is the wrong contract for anything with a
+latency budget, and `bBehind` is what lets such a caller tell "done" from "gave
+up early" and reschedule itself.  `zskvbench --defer-repack` composes it with
+the URI parameter and times the two apart.
 
 **This is a bulk-load-window shape, not a mode.** During the window the file
 count is unbounded -- upstream measured 118 files at 2M records with the
@@ -844,6 +883,61 @@ own rate -- so the 68% byte saving finally shows up in the clock.
 Every catch-up in `zskvbench` is followed by an untimed
 `PRAGMA integrity_check`, because this is the only place in the tier that
 drives a merge from our side rather than the library's.
+
+#### Commit latency as a distribution, and what a background repack buys
+
+Every store number above is a rate, and a rate cannot answer the question the
+deployment has.  Cyrus commits one message at a time, and the repack cascade
+runs synchronously inside whichever write transaction trips it -- so one
+delivery in N pays for a whole generation merge while the rest pay nothing.
+That is a tail problem, and it is the actual argument for moving repacks off
+the critical path: not throughput, which deferral no longer wins at all.
+
+`zskvbench --latency N` does N single-record commits, times each one, and
+reports percentiles.  It also ATTRIBUTES the outliers instead of assuming: the
+library's repack and conversion counters (A-17) are sampled either side of
+every commit, so a commit that merged is known to have merged rather than
+inferred to have.  Without that the tail could equally be a txg boundary or the
+append buffer growing, and the fix for each is different.
+
+    20000 single-record commits, rowid, laptop, one pass
+
+                        p50     p90     p99   p99.9     max
+    cascade armed     0.026   0.037   0.093   0.440   2.184 ms
+      merged: 25 of 20000 (0.12%), p50 0.476, max 2.184 -- 3% of total time
+    zs_norepack=1     0.023   0.031   0.047   0.236   0.787 ms
+      merged: 19 of 20000 (0.10%), p50 0.449, max 0.787 -- 2% of total time
+
+**Two things fall out, and the second is the one that matters.**
+
+The tail is real: p99.9 is 17x the median and the max is 84x it.  A commit that
+merges costs about 18x one that does not.
+
+But **disarming the cascade removes the repacks from the tail and not the
+conversions, and the conversions are most of it** -- 19 of the 25 slow commits
+survive `zs_norepack=1`, and the counters say why: 19 conversions, 0 repacks.
+A conversion is how a generation gets sealed into sorted form; every generation
+converts exactly once and no setting changes that.  So the ceiling on what a
+background repack can buy here is the max (2.2ms to 0.8ms) plus 1% of total
+time, and the p99.9 stays within 2x.
+
+That is a laptop number and the conclusion is not yet transferable: `unlink`
+costs ~1ms on the production pool against nothing on APFS, and a repack does a
+lot of them, so both the frequency and the size of those outliers should grow
+on ZFS.  `prodrun.sh` has a `latency` phase that runs exactly this pair on both
+datasets.  **Until that lands, the honest statement is that the tail exists,
+that the deferrable part of it is the smaller part, and that nobody should add
+a thread to a process that has none on the strength of a laptop measurement.**
+
+`sqlite3ZsRepackCatchUp()` takes an `nMaxMerges` bound and returns whether more
+work remains, so a caller with a latency budget can do one merge per idle slot
+and reschedule rather than block for the whole backlog -- a merge rewrites a
+generation and cannot be interrupted once started.  Never disarming is the
+failure mode to design against: point-lookup cost is linear in the file count
+(D-14d), and a 2M-record load left un-repacked leaves 119 files and takes
+`readdir` from 6,378 calls to 29,723.  So a delayed-work scheduler should
+trigger on state (`*pbBehind`, file count) and not on idleness alone, with a
+floor where a commit pays inline if the backlog crosses a threshold.
 
 #### rollover_size, the pointer table, and what actually wins (measured)
 
@@ -1020,17 +1114,19 @@ one number, which is stronger evidence than the row itself.
 aes-256-gcm over the whole span synchronously in the caller, in the
 `dmu_sync -> arc_write -> zio_write` path the perf profile shows under
 `zil_commit_impl`.  2.05us/KB is about 490MB/s, which is a plausible
-compress-then-encrypt rate for one core.  So the "9x per synced byte against
-stock" recorded below is a comparison of CPU per byte, not of storage
-behaviour.
+compress-then-encrypt rate for one core.  **Wrong, and the plausibility is how
+it got in: a mechanism was fitted to a number and then written down as fact.**
+A call graph shows no crypto in the caller at all; the CPU is per-block zio
+setup and taskq dispatch (see "What our fdatasync actually spends its CPU
+on").  Kept because the arithmetic looked convincing and was not evidence.
 
 **Superseded on 2026-08-19: measured in wall time there is no 9x and no
 deficit.** `strace -c -w` puts the two engines' slopes at 3.74 against
 2.82us/KB, a factor of 1.33, on a shared ~125us ZIL floor that stock pays four
 times per commit and we pay once -- so we are cheaper on `fdatasync` at every
-transaction size measured.  System time flattered stock because its crypto is
-deferred to a txg on another thread and never appears in its CPU accounting.
-See "The per-byte sync deficit does not exist".
+transaction size measured.  The CPU asymmetry that remains is per-block zio
+setup and taskq dispatch, not crypto.  See "The per-byte sync deficit does not
+exist" and "What our fdatasync actually spends its CPU on".
 
 #### An abort with nothing in the file writes nothing (2.7.0, C-8b)
 
@@ -1099,17 +1195,16 @@ what it turns out to be: our large `fdatasync` is 74% CPU (312us system of
 420us wall), and the perf profile puts that CPU in
 `zil_commit_impl -> zil_lwb_write_issue -> zfs_get_data -> dmu_sync ->
 arc_write -> zio_write` -- ZFS compressing (zstd) and encrypting
-(aes-256-gcm) the whole span synchronously in our thread.  2.05us/KB is
-~490MB/s, a believable single-core compress-then-encrypt rate.  Stock's
-profile does NOT land there: its 45.97% of cycles under `do_syscall_64` is
-`__x64_sys_pwrite64 -> zfs_write -> dmu_assign_arcbuf_by_dnode`, buffered,
-with the compression and encryption happening later in a txg on another
-thread.  So the difference is the data shape after all -- a large synchronous
-append pays for its own crypto inline; 4K overwrites of an already-allocated
-journal hand it to the pool.  What is still untested is whether the slope is
-really the crypto: **`compression=off` on a scratch dataset should cut it, and
-`logbias=throughput` should not.**  That is one `zfs create` away and is the
-next thing to run on this row.
+(aes-256-gcm) the whole span synchronously in our thread.  **Refuted the same
+day by a call graph** (see "What our fdatasync actually spends its CPU on"):
+there is no crypto in the caller's stack, and `ZIO_STAGE_ISSUE_ASYNC` runs
+before `ZIO_STAGE_WRITE_COMPRESS`, so both engines' crypto is on a taskq
+thread.  Stock's profile is `__x64_sys_pwrite64 -> zfs_write ->
+dmu_assign_arcbuf_by_dnode`, buffered, and ours is per-block zio allocation,
+rangelock, znode lookup and taskq wakeup -- a different asymmetry from the one
+claimed, and one that scales with the BLOCK count.  `compression=off` is
+therefore no longer the decisive test; **recordsize is**, because a 130KB span
+is ~32 blocks at 4K against one or two at 128K.
 
 #### The cached small-transaction shape: no sign flip
 
