@@ -233,6 +233,13 @@ do_execsql_test -db db2 5.2 {
 } {1 2 3}
 forcedelete test.db2
 
+# Remove the directories created by the tests above.  Leaving them
+# behind changes the outcome of later test files run in the same
+# directory: zipfile-25.0 opens a file named "x" and expects the open
+# to fail, but fopen() on a directory succeeds on unix, so the failure
+# surfaces later as "error in fread()" instead.
+forcedelete w x y z
+
 
 
 finish_test

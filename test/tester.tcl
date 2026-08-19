@@ -278,6 +278,12 @@ proc do_delete_file {force args} {
   set nDelay [getFileRetryDelay]  ;# Delay in ms before retrying.
 
   foreach filename $args {
+    # zeroskip: a database is a directory; plain [file delete] cannot
+    # remove a non-empty one, so escalate to -force.
+    if {!$force && $::sqlite_options(zeroskip)
+        && [file isdirectory $filename]} {
+      set force 1
+    }
     # On windows, sometimes even a [file delete -force] can fail just after
     # a file is closed. The cause is usually "tag-alongs" - programs like
     # anti-virus software, automatic backup tools and various explorer

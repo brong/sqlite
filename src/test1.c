@@ -2976,7 +2976,10 @@ static int SQLITE_TCLAPI test_atomic_batch_write(
   }
 
   rc = sqlite3_file_control(db, "main", SQLITE_FCNTL_FILE_POINTER, (void*)&pFd);
-  dc = pFd->pMethods->xDeviceCharacteristics(pFd);
+  if( pFd && pFd->pMethods ){
+    /* the zeroskip engine's vestigial pager has no open file */
+    dc = pFd->pMethods->xDeviceCharacteristics(pFd);
+  }
   if( dc & SQLITE_IOCAP_BATCH_ATOMIC ){
     bRes = 1;
   }

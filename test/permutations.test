@@ -989,6 +989,109 @@ foreach discard_rate {0 10 50 90 100} {
   } -files ${perm-alt-pcache-testset}
 }
 
+test_suite "zeroskip" -description {
+  Run tests against the zeroskip storage engine (SQLITE_ZEROSKIP).
+  Excluded files test the stock pager/btree storage layer itself;
+  doc/zeroskip-testsuite.md carries one justification line per entry.
+} -files [test_set $::allquicktests -exclude {
+  *malloc* *ioerr* *fault* *bigfile* *_err*
+  *fts5corrupt* *fts5big* *fts5aj* *rbucrash*
+  wal* pager* journal* crash* corrupt* incrblob* incrvacuum* dbstat*
+  dbpage* backup* mmap* superlock* snapshot* vacuum* io.test
+  avfs.test stmtvtab1.test *recover* multiplex*
+  nolock* syscall.test fstat.test symlink.test shmlock.test
+  delete_db.test external_reader.test alter2.test
+  jrnlmode* sync.test sync2.test zerodamage.test cksumvfs.test
+  oserror.test lock*.test quota*.test nockpt.test cachespill.test
+  e_wal* exclusive*.test rdonly.test resetdb.test minmax3.test
+  autovacuum*.test cache.test cacheflush.test pcache2.test
+  memsubsys1.test mjournal.test subjournal.test rollback.test
+  rollback2.test securedel.test stat.test reservebytes.test
+  filefmt.test filectrl.test fallocate.test chunksize.test
+  shortread1.test diskfull.test unixexcl.test rowallock.test
+  busy.test busy2.test atomic.test atomic2.test pagesize.test
+  memdb.test memdb1.test memdb2.test shell*.test altercorrupt.test
+  incrcorrupt.test intckcorrupt.test intckbusy.test e_vacuum.test
+  swarmvtab*.test expert1.test
+  alter3.test
+  atof1.test
+  attach.test
+  attach2.test
+  attach3.test
+  attach4.test
+  autoinc.test
+  avtrans.test
+  capi2.test
+  capi3.test
+  capi3b.test
+  capi3c.test
+  capi3e.test
+  collate2.test
+  collate3.test
+  collate4.test
+  collate5.test
+  collate9.test
+  createtab.test
+  dataversion1.test
+  date.test
+  dbfuzz001.test
+  descidx1.test
+  descidx2.test
+  descidx3.test
+  e_reindex.test
+  e_uri.test
+  enc.test
+  enc2.test
+  expridx1.test
+  expridx2.test
+  fkey1.test
+  format4.test
+  gencol1.test
+  index5.test
+  interrupt.test
+  interrupt2.test
+  like3.test
+  misc1.test
+  misc8.test
+  openv2.test
+  pendingrace.test
+  pragma.test
+  pragma2.test
+  pragma3.test
+  pragma6.test
+  progress.test
+  readonly.test
+  reindex.test
+  schema6.test
+  shrink.test
+  sort5.test
+  stat.test
+  stmt.test
+  tclsqlite.test
+  tempdb.test
+  tempdb2.test
+  temptable.test
+  temptable2.test
+  thread1.test
+  thread3.test
+  tkt-313723c356.test
+  tkt-5d863f876e.test
+  tkt-f3e5abed55.test
+  tkt-fc62af4523.test
+  tkt1512.test
+  tkt2409.test
+  tkt2920.test
+  tkt3121.test
+  tkt3457.test
+  tkt4018.test
+  triggerA.test
+  uri.test
+  utf16align.test
+  values.test
+  window6.test
+  windowE.test
+}]
+
 test_suite "journaltest" -description {
   Check that pages are synced before being written (test_journal.c).
 } -initialize {
@@ -1148,6 +1251,13 @@ test_suite "win_unc_locking" -prefix "" -description {
 #       -dbconfig    SCRIPT
 #
 proc run_tests {name args} {
+  # With ZS_LIST_ONLY set, print the file list and exit: lets external
+  # runners (test/zs/run-suite.sh) drive files in isolated processes.
+  if {[info exists ::env(ZS_LIST_ONLY)]} {
+    array set OO $args
+    foreach f $OO(-files) { puts "FILE $f" }
+    exit 0
+  }
   set options(-initialize) ""
   set options(-shutdown) ""
   set options(-prefix) ""

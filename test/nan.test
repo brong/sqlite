@@ -152,7 +152,10 @@ sqlite3_finalize $::STMT
 # NULL.
 #
 if {![nonzero_reserved_bytes]} {
-  do_test nan-3.1 {
+  # zeroskip: nan-3.x injects raw NaN bytes into the database file
+# with hexio_write; a zeroskip database is a directory.
+if {!$::sqlite_options(zeroskip)} {
+do_test nan-3.1 {
     db eval {
       DELETE FROM t1;
       INSERT INTO t1 VALUES(0.5);
@@ -196,6 +199,7 @@ if {![nonzero_reserved_bytes]} {
 # Verify that the sqlite3AtoF routine is able to handle extreme
 # numbers.
 #
+}
 do_test nan-4.1 {
   db eval {DELETE FROM t1}
   db eval "INSERT INTO t1 VALUES([string repeat 9 307].0)"

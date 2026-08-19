@@ -1,0 +1,113 @@
+set testdir [file dirname [file dirname [file normalize $argv0]]]
+if {![file exists $testdir/tester.tcl]} { set testdir /Users/brong/src/sqlite/test }
+source $testdir/tester.tcl
+
+# The Btree caches meta values (the schema cookie above all) for the
+# lifetime of a transaction, which is sound because the snapshot is
+# fixed.  This file walks the paths that cache and invalidate it: a
+# write committing under a streaming reader, cross-connection schema
+# changes, and a DDL statement rolled back to a savepoint.
+#
+# WHAT IT DOES NOT CATCH, stated because the opposite would be worse
+# than having no test.  Removing EITHER invalidation the engine does at
+# a transaction boundary leaves every case below passing:
+#
+#   * The keepRead reopen (zsbtCommitPhaseTwo / zsbtRollback).  A write
+#     that commits while another statement on this connection is still
+#     reading reopens a READ transaction, and malloc hands it the exact
+#     address the write transaction just freed -- verified by
+#     instrumenting the reopen: new == the freed pointer, with the
+#     cookie still cached.  So the pointer scope alone does not protect
+#     it.  What makes it unreachable from here is that the stale window
+#     closes when the streaming statement ends, and another connection
+#     cannot commit DDL before that, because this connection held the
+#     write lock until the commit that opened the window.  Hitting it
+#     needs a schema change landing between the commit and the reopen,
+#     which is a race no single-threaded test can schedule.
+#
+#   * The undo-log replay (zsbtUndoReplay).  A rolled-back DDL restores
+#     the cookie through zs_txn_store rather than sqlite3BtreeUpdateMeta,
+#     so the cache holds the post-DDL value over pre-DDL data.  That is
+#     wrong but self-correcting: OP_Transaction sees a cookie mismatch,
+#     reprepares, and the next transaction clears the cache anyway, so
+#     the visible effect is extra reprepares rather than a wrong answer.
+#
+# Both invalidations stay because they are free and the reasoning above
+# is about reachability, not about them being unnecessary.
+
+sqlite3 db2 test.db
+
+do_execsql_test mc-1.0 {
+  CREATE TABLE t1(a INTEGER PRIMARY KEY, b);
+  INSERT INTO t1 VALUES(1,'one'),(2,'two'),(3,'three');
+} {}
+
+# Drive the keepRead path: an inner write commits while the outer SELECT
+# is mid-scan, so the connection reopens a read transaction underneath.
+do_test mc-1.1 {
+  set seen [list]
+  db eval { SELECT a FROM t1 ORDER BY a } {
+    lappend seen $a
+    if {$a==1} { db eval { INSERT INTO t1 VALUES(10,'ten') } }
+  }
+  # a row inserted mid-scan may or may not be met by the ongoing scan --
+  # same connection, same transaction, so there is no snapshot to hide it.
+  # What this step exists for is the commit underneath the reader, not the
+  # scan's contents, so assert only what is defined.
+  lsort -integer [lsearch -all -inline -integer -not $seen 10]
+} {1 2 3}
+
+# Another connection adds a table.  The first connection must see it --
+# it can only do so by noticing the schema cookie changed.
+do_test mc-1.2 {
+  db2 eval { CREATE TABLE t2(x); INSERT INTO t2 VALUES('from-db2'); }
+  db eval { SELECT x FROM t2 }
+} {from-db2}
+
+# Same again for a change to an existing table, which is the case where
+# a stale cookie yields wrong COLUMNS rather than a missing table.
+do_test mc-1.3 {
+  set seen [list]
+  db eval { SELECT a FROM t1 ORDER BY a } {
+    lappend seen $a
+    if {$a==1} { db eval { INSERT INTO t1 VALUES(11,'eleven') } }
+  }
+  db2 eval { ALTER TABLE t1 ADD COLUMN c DEFAULT 'added'; }
+  db eval { SELECT c FROM t1 WHERE a=1 }
+} {added}
+
+# A DDL statement rolled back to a savepoint restores the cookie through
+# the undo log, which writes it with zs_txn_store rather than through
+# sqlite3BtreeUpdateMeta -- so the cache cannot be written through there
+# and must be dropped.
+do_test mc-1.4 {
+  db eval {
+    BEGIN;
+    SAVEPOINT s1;
+    CREATE TABLE t3(y);
+    INSERT INTO t3 VALUES('gone');
+    ROLLBACK TO s1;
+    RELEASE s1;
+    COMMIT;
+  }
+  list [catch { db eval { SELECT y FROM t3 } } msg] $msg
+} {1 {no such table: t3}}
+
+# ...and the same rollback must leave the schema usable afterwards.
+do_test mc-1.5 {
+  db eval { CREATE TABLE t4(z); INSERT INTO t4 VALUES('kept'); }
+  db2 eval { SELECT z FROM t4 }
+} {kept}
+
+# The cookie a second connection reads must track committed DDL exactly,
+# with no transaction open on either side to hide a stale value.
+do_test mc-1.6 {
+  set r [list]
+  foreach n {5 6 7} {
+    db  eval "CREATE TABLE tt${n}(q)"
+    lappend r [db2 eval "SELECT count(*) FROM tt${n}"]
+  }
+  set r
+} {0 0 0}
+
+finish_test

@@ -664,6 +664,10 @@ do_execsql_test update-17.10 {
 # a memory-accounting assert().
 #
 reset_db
+# zeroskip: UTF-16 databases are a documented engine limitation (the
+# order-preserving key encoding is UTF-8 only); 18.10/18.20 set
+# PRAGMA encoding=UTF16.
+if {!$::sqlite_options(zeroskip)} {
 do_execsql_test update-18.10 {
   PRAGMA encoding = 'UTF16';
   CREATE TABLE t0(c0 REAL, c1);
@@ -685,6 +689,7 @@ do_execsql_test update-18.20 {
   INSERT INTO t0(c0) VALUES (0), (0);
   SELECT * FROM t0;
 } {0 0}
+}
 
 # 2019-12-28 assertion fault reported by Yongheng
 # Similar to ticket ec8abb025e78f40c

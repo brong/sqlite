@@ -358,24 +358,29 @@ do_catchsql_test 6.4 {
 
 db collate {"""} [list string compare -nocase]
 
+# zeroskip: indexes on application-registered collations are a
+# documented engine limitation (memcmp-encodable keys); 6.5-6.8 build
+# a PRIMARY KEY on one.
+ifcapable !zeroskip {
+
 do_execsql_test 6.5 {
   PRAGMA foreign_keys = ON;
   CREATE TABLE p1(a PRIMARY KEY COLLATE '"""');
   CREATE TABLE c1(x, y REFERENCES p1);
 } {}
 
-do_execsql_test 6.6 { 
-  INSERT INTO p1 VALUES('abc'); 
-  INSERT INTO c1 VALUES(1, 'ABC'); 
+do_execsql_test 6.6 {
+  INSERT INTO p1 VALUES('abc');
+  INSERT INTO c1 VALUES(1, 'ABC');
 }
 
 ifcapable foreignkey {
-  do_catchsql_test 6.7 { 
-    DELETE FROM p1 WHERE rowid = 1 
+  do_catchsql_test 6.7 {
+    DELETE FROM p1 WHERE rowid = 1
   } {1 {FOREIGN KEY constraint failed}}
 }
 
-do_execsql_test 6.8 { 
+do_execsql_test 6.8 {
   INSERT INTO p1 VALUES('abb');
   INSERT INTO p1 VALUES('wxz');
   INSERT INTO p1 VALUES('wxy');
@@ -385,6 +390,8 @@ do_execsql_test 6.8 {
   INSERT INTO c1 VALUES(4, 'WXY');
   SELECT x, y FROM c1 ORDER BY y COLLATE """""""";
 } {2 abb 1 ABC 4 WXY 3 wxz}
+
+}
 
 # 2015-04-15:  Nested COLLATE operators
 #

@@ -14,6 +14,10 @@ proc bc_find_binaries {zCaption} {
   }
   foreach file [glob -nocomplain $pattern] {
     if {$file==$self} continue
+    # zeroskip: the SQLITE_ZEROSKIP testfixture uses a different storage
+    # engine and on-disk format; cross-engine file compatibility is not
+    # a meaningful test.
+    if {[string match *zs $file] || [string match *zs.exe $file]} continue
     if {[file executable $file] && [file isfile $file]} {lappend binaries $file}
   }
 

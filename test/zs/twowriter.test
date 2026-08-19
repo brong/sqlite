@@ -1,0 +1,42 @@
+set testdir /Users/brong/src/sqlite/test
+source $testdir/tester.tcl
+
+# Two connections on the same database IN ONE PROCESS.  fcntl locks are
+# per-process, so before C-1j this was the shape that silently lost a
+# committed transaction.
+sqlite3 db2 test.db
+
+do_execsql_test tw-1.0 { CREATE TABLE t1(a INTEGER PRIMARY KEY, b); }
+
+# sequential writers: both commits must survive
+do_test tw-1.1 {
+  db  eval { INSERT INTO t1 VALUES(1,'from-db') }
+  db2 eval { INSERT INTO t1 VALUES(2,'from-db2') }
+  db  eval { SELECT a, b FROM t1 ORDER BY a }
+} {1 from-db 2 from-db2}
+
+# concurrent writers: the second must be told BUSY, not silently allowed
+do_test tw-1.2 {
+  db eval { BEGIN IMMEDIATE }
+  set rc [catch { db2 eval { BEGIN IMMEDIATE } } msg]
+  db eval { ROLLBACK }
+  list $rc $msg
+} {1 {database is locked}}
+
+# and after the first writer commits, the second can proceed
+do_test tw-1.3 {
+  db  eval { BEGIN IMMEDIATE; INSERT INTO t1 VALUES(3,'x'); COMMIT }
+  db2 eval { BEGIN IMMEDIATE; INSERT INTO t1 VALUES(4,'y'); COMMIT }
+  db2 eval { SELECT count(*) FROM t1 }
+} {4}
+
+# interleaved read while the other writes
+do_test tw-1.4 {
+  db eval { BEGIN IMMEDIATE; INSERT INTO t1 VALUES(5,'z') }
+  set seen [db2 eval { SELECT count(*) FROM t1 }]
+  db eval { COMMIT }
+  list $seen [db2 eval { SELECT count(*) FROM t1 }]
+} {4 5}
+
+db2 close
+finish_test

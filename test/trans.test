@@ -971,7 +971,9 @@ for {set i 2} {$i<=$limit} {incr i} {
        }
     } {}
     catch flush_async_queue
-    if {$tcl_platform(platform)=="unix"} {
+    # zeroskip: durability gates run inside the zeroskip library, not
+    # through the SQLite VFS, so the VFS sync counters stay zero.
+    if {$tcl_platform(platform)=="unix" && !$::sqlite_options(zeroskip)} {
       do_test trans-9.$i.4-$cnt {
          expr {$sqlite_sync_count>0}
       } 1

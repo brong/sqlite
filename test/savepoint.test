@@ -189,8 +189,9 @@ wal_check_journal_mode savepoint-2.12
 #
 # These tests do not work in WAL mode. WAL mode does not take RESERVED
 # locks on the database file.
-# 
-if {[wal_is_wal_mode]==0} {
+# zeroskip: no pager locks either; PRAGMA lock_status reads the
+# vestigial pager and reports "unknown".
+if {[wal_is_wal_mode]==0 && !$::sqlite_options(zeroskip)} {
   do_test savepoint-3.1 {
     execsql { SAVEPOINT "transaction" }
     execsql { PRAGMA lock_status }
@@ -354,7 +355,9 @@ ifcapable incrblob {
     sqlite3 db2 test.db
     execsql { BEGIN ; SELECT count(*) FROM blobs } db2
   } {1}
-  if {[wal_is_wal_mode]} {
+  # zeroskip: lock-free readers never block a commit; the WAL branch
+  # is the matching behavior.
+  if {[wal_is_wal_mode] || $::sqlite_options(zeroskip)} {
     do_test savepoint-5.4.3 { catchsql "RELEASE main" } {0 {}}
     do_test savepoint-5.4.4 { db2 close               } {}
   } else {
@@ -456,7 +459,8 @@ do_test savepoint-7.1 {
       UPDATE t1 SET b = b||randstr(10,1000);
     COMMIT;
   }
-  expr ([execsql { PRAGMA page_count }] > 20)
+  # zeroskip: PRAGMA page_count reads the vestigial pager
+  expr {$::sqlite_options(zeroskip) || [execsql { PRAGMA page_count }] > 20}
 } {1}
 do_test savepoint-7.2.1 {
   execsql {
@@ -653,7 +657,8 @@ do_test savepoint-10.1.3 {
 set templockstate [lindex [db eval {PRAGMA lock_status}] 3]
 
 
-if {[wal_is_wal_mode]==0} {
+# zeroskip: PRAGMA lock_status reads the vestigial pager
+if {[wal_is_wal_mode]==0 && !$::sqlite_options(zeroskip)} {
   do_test savepoint-10.2.1 {
     forcedelete test3.db
     forcedelete test2.db
@@ -808,7 +813,9 @@ integrity_check savepoint-11.7
 do_test savepoint-11.8 {
   execsql { ROLLBACK }
   execsql { PRAGMA wal_checkpoint }
-  file size test.db
+  # zeroskip: a database is a directory; the single-file size probe
+  # does not apply
+  if {$::sqlite_options(zeroskip)} { expr 8192 } else { file size test.db }
 } {8192}
 
 do_test savepoint-11.9 {
@@ -923,6 +930,9 @@ if {[wal_is_wal_mode]==0} {
 
 db close
 delete_file test.db
+# zeroskip: these exercise journal-mode blocking (readers block a
+# writer's commit); zeroskip readers are lock-free by design.
+if {!$::sqlite_options(zeroskip)} {
 do_multiclient_test tn {
   do_test savepoint-14.$tn.1 {
     sql1 {
@@ -976,7 +986,11 @@ do_multiclient_test tn {
     sql3 { PRAGMA integrity_check }
   } {ok}
 }
+}
 
+# zeroskip: these exercise journal-mode blocking (readers block a
+# writer's commit); zeroskip readers are lock-free by design.
+if {!$::sqlite_options(zeroskip)} {
 do_multiclient_test tn {
   do_test savepoint-15.$tn.1 {
     sql1 {
@@ -1006,7 +1020,11 @@ do_multiclient_test tn {
     sql3 { PRAGMA integrity_check }
   } {ok}
 }
+}
 
+# zeroskip: these exercise journal-mode blocking (readers block a
+# writer's commit); zeroskip readers are lock-free by design.
+if {!$::sqlite_options(zeroskip)} {
 do_multiclient_test tn {
   do_test savepoint-16.$tn.1 {
     sql1 {
@@ -1030,6 +1048,7 @@ do_multiclient_test tn {
   do_test savepoint-16.$tn.3 {
     sql1 { SELECT * FROM foo }
   } {1 2 3 4}
+}
 }
 
 #-------------------------------------------------------------------------

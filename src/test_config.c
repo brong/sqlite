@@ -476,7 +476,8 @@ static void set_options(Tcl_Interp *interp){
   Tcl_SetVar2(interp, "sqlite_options", "icu_collations", "0", TCL_GLOBAL_ONLY);
 #endif
 
-#ifdef SQLITE_OMIT_INCRBLOB
+#if defined(SQLITE_OMIT_INCRBLOB) || defined(SQLITE_ZEROSKIP)
+  /* the zeroskip engine does not implement incremental blob I/O */
   Tcl_SetVar2(interp, "sqlite_options", "incrblob", "0", TCL_GLOBAL_ONLY);
 #else
   Tcl_SetVar2(interp, "sqlite_options", "incrblob", "1", TCL_GLOBAL_ONLY);
@@ -645,6 +646,12 @@ Tcl_SetVar2(interp, "sqlite_options", "mergesort", "1", TCL_GLOBAL_ONLY);
   Tcl_SetVar2(interp, "sqlite_options", "shared_cache", "0", TCL_GLOBAL_ONLY);
 #else
   Tcl_SetVar2(interp, "sqlite_options", "shared_cache", "1", TCL_GLOBAL_ONLY);
+#endif
+
+#ifdef SQLITE_ZEROSKIP
+  Tcl_SetVar2(interp, "sqlite_options", "zeroskip", "1", TCL_GLOBAL_ONLY);
+#else
+  Tcl_SetVar2(interp, "sqlite_options", "zeroskip", "0", TCL_GLOBAL_ONLY);
 #endif
 
 #ifdef SQLITE_OMIT_SUBQUERY

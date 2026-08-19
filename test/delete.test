@@ -273,6 +273,11 @@ do_test delete-8.0 {
     SELECT * FROM t3;
   }
 } {123}
+# zeroskip: the read-only-database idiom (chmod 0444 on test.db)
+# assumes a single-file database; a zeroskip database is a directory
+# and write-protecting it needs chmod -R, which zeroskip cannot yet
+# open read-only either (upstream ask queued).
+ifcapable !zeroskip {
 db close
 catch {forcedelete test.db-journal}
 catch {file attributes test.db -permissions 0444}
@@ -316,6 +321,9 @@ integrity_check delete-8.7
 #
 catch {file attributes test.db -readonly 0}
 db close
+}
+if {$::sqlite_options(zeroskip)} { db close }
+
 forcedelete test.db test.db-journal
 
 # The following tests verify that SQLite correctly handles the case
