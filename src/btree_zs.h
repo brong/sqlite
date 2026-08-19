@@ -62,4 +62,19 @@ int sqlite3ZsStats(sqlite3 *db, const char *zDb,
 int sqlite3ZsRepackCatchUp(sqlite3 *db, const char *zDb, int nMaxMerges,
                            int *pnMerges, int *pbBehind);
 
+/* Convert the active generation now (zs_db_seal), rather than leaving it to
+** whichever commit grows the file past rollover_size.  Not inside a
+** transaction.  A no-op when there is nothing to seal.
+**
+** This is the latency lever for CONVERSIONS, and it is the one that matters
+** for a caller that commits per message.  zs_norepack/RepackCatchUp move the
+** repack cascade off the write path and leave conversions on it: measured at
+** 20000 single-record commits, 19 of the 25 slow commits survive disarming the
+** cascade, and the counters say they are conversions.  A conversion is
+** unavoidable once per generation, but WHEN it happens is not -- calling this
+** from an idle moment means the commit that would have paid for it has nothing
+** to do.  Its size is bounded by rollover_size (D-12d), so that knob sets how
+** tall the outlier can be and this call sets when it lands. */
+int sqlite3ZsSeal(sqlite3 *db, const char *zDb);
+
 #endif /* SQLITE_BTREE_ZS_H */

@@ -359,11 +359,20 @@ say "phase: commit latency DISTRIBUTION at the per-message shape"
 # pass (a distribution, not a best-of).
 {
 for d in "$@"; do
-  for cfg in "armed:" "norepack:zs_norepack=1"; do
-    lbl=${cfg%%:*}; uri=${cfg#*:}
+  # armed -> norepack -> norepack+seal, which is the ladder the deployment
+  # walks.  norepack takes the REPACKS off the write path and leaves the
+  # conversions, which on the laptop are 19 of the 25 slow commits; sealing
+  # from idle (2.9.0's zs_db_seal, via sqlite3ZsSeal) preempts those too.  The
+  # seal cadence has to beat rollover_txns -- at one record per transaction it
+  # is the SPAN bound that seals a generation, not the byte bound, so 1024
+  # commits is the number to be under.
+  for cfg in "armed::" "norepack:zs_norepack=1:" \
+             "norepack+seal/500:zs_norepack=1:500"; do
+    lbl=${cfg%%:*}; rest=${cfg#*:}; uri=${rest%%:*}; seal=${rest#*:}
     w="$d/lat"; cleanup "$w"; mkdir -p "$w"
     echo "-- $d cascade $lbl (recordsize $(dataset_recordsize "$d"))"
-    ./zskvbench --dir "$w" --latency "$NMID" --rowid ${uri:+--uri "$uri"}
+    ./zskvbench --dir "$w" --latency "$NMID" --rowid \
+      ${uri:+--uri "$uri"} ${seal:+--seal-every "$seal"}
     cleanup "$w"
   done
 done

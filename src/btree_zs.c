@@ -849,6 +849,30 @@ static int zsbtSaveAllCursors(Btree *p, int errCode, int writeOnly){
   return SQLITE_OK;
 }
 
+/* Lock ordering across ATTACHed zeroskip databases (C-1h).
+**
+** zeroskip orders locks within one database and leaves an order across several
+** to the caller, so a connection holding write locks on two attached databases
+** could in principle deadlock against one taking them the other way.  What we
+** inherit from SQLite makes that tolerable rather than impossible:
+**
+** - the order is deterministic per connection.  Both places that emit
+**   OP_Transaction walk db->aDb in ASCENDING index order (sqlite3FinishCoding
+**   and sqlite3BeginTransaction), so within one attach layout every connection
+**   locks in the same sequence;
+** - two connections whose attach layouts DIFFER (the same two files as
+**   main+aux and aux+main) can still take them in opposite orders, and that is
+**   a genuine cycle;
+** - it resolves by timeout rather than hanging, because the loop below gives
+**   up when the busy handler does: SQLITE_BUSY unwinds the statement, SQLite
+**   rolls back, and the other side's lock is released.  A caller that installs
+**   an INFINITE busy handler removes that escape and can livelock -- which is
+**   also true of stock SQLite over two attached files, so it is inherited
+**   rather than introduced.
+**
+** Practical rule for a deployment: attach in the same order everywhere, or set
+** sqlite3_busy_timeout rather than an unbounded handler.  Untested here; the
+** two-writer coverage is single-database (test/zs/twowriter.test). */
 static int zsbtBegin(Btree *p, int wrflag){
   int rc;
   int zrc;
@@ -2531,6 +2555,22 @@ int sqlite3ZsRepackCatchUp(sqlite3 *db, const char *zDb, int nMaxMerges,
   if( pnMerges ) *pnMerges = n;
   if( pbBehind ) *pbBehind = zs_db_should_repack(pZs) ? 1 : 0;
   return SQLITE_OK;
+}
+
+/* Convert the active generation from idle time.  See btree_zs.h: this is the
+** conversion half of the latency story, which ZS_NOAUTOREPACK does not cover.
+** Must not be called inside a transaction -- a conversion takes the write
+** lock. */
+int sqlite3ZsSeal(sqlite3 *db, const char *zDb){
+  struct zs_db *pZs;
+  int iDb, zrc;
+
+  iDb = zDb ? sqlite3FindDbName(db, zDb) : 0;
+  if( iDb<0 || db->aDb[iDb].pBt==0 ) return SQLITE_ERROR;
+  pZs = sqlite3ZsBtreeDb(db->aDb[iDb].pBt);
+  if( pZs==0 ) return SQLITE_ERROR;
+  zrc = zs_db_seal(pZs);
+  return zrc==ZS_OK ? SQLITE_OK : zsbtErr(zrc);
 }
 
 int sqlite3ZsStats(sqlite3 *db, const char *zDb,

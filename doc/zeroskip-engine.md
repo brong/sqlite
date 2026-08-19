@@ -908,26 +908,66 @@ append buffer growing, and the fix for each is different.
     zs_norepack=1     0.023   0.031   0.047   0.236   0.787 ms
       merged: 19 of 20000 (0.10%), p50 0.449, max 0.787 -- 2% of total time
 
-**Two things fall out, and the second is the one that matters.**
+**The tail is real, and disarming the cascade only half fixes it.** p99.9 is
+17x the median.  `zs_norepack=1` takes p99.9 from 0.386 to 0.232ms -- but 19 of
+the 25 slow commits survive it, and the counters say why: 19 conversions, 0
+repacks.  A conversion is how a generation gets sealed into sorted form, it
+happens once per generation, and `ZS_NOAUTOREPACK` says nothing about it.
 
-The tail is real: p99.9 is 17x the median and the max is 84x it.  A commit that
-merges costs about 18x one that does not.
+**The lever for the other half is `zs_db_seal`, which this project had missed
+and library 2.9.0 documents as the conversion latency lever.** A conversion is
+unavoidable, but *when* it happens is not: by default it lands on whichever
+commit grows the file past the generation bound, and calling seal from an idle
+moment means that commit has nothing to do.  Exposed here as `sqlite3ZsSeal()`.
 
-But **disarming the cascade removes the repacks from the tail and not the
-conversions, and the conversions are most of it** -- 19 of the 25 slow commits
-survive `zs_norepack=1`, and the counters say why: 19 conversions, 0 repacks.
-A conversion is how a generation gets sealed into sorted form; every generation
-converts exactly once and no setting changes that.  So the ceiling on what a
-background repack can buy here is the max (2.2ms to 0.8ms) plus 1% of total
-time, and the p99.9 stays within 2x.
+    20000 single-record commits, rowid, laptop, one pass
 
-That is a laptop number and the conclusion is not yet transferable: `unlink`
-costs ~1ms on the production pool against nothing on APFS, and a repack does a
-lot of them, so both the frequency and the size of those outliers should grow
-on ZFS.  `prodrun.sh` has a `latency` phase that runs exactly this pair on both
-datasets.  **Until that lands, the honest statement is that the tail exists,
-that the deferrable part of it is the smaller part, and that nobody should add
-a thread to a process that has none on the strength of a laptop measurement.**
+                            p50   p99.9     merging commits
+    cascade armed         0.023   0.386     25 (0.12%), 3% of total time
+    zs_norepack=1         0.023   0.232     19 (0.10%), 1%
+    + seal every 500      0.024   0.226     NONE
+    + seal every 4000     0.023   0.225     15 (0.07%), 2%
+
+**Sealing every 500 commits removes the merging-commit class entirely** rather
+than shrinking it: no commit in 20000 did any file-lifecycle work, and the 40
+conversions all happened in the untimed seal.  p99.9 improves 42% against the
+default.
+
+**The cadence matters and 4000 is too slow, for a reason worth knowing: at one
+record per transaction it is D-9d's SPAN bound that seals a generation, not
+`rollover_size`.** 20000 commits produce 19 conversions -- one per 1024 spans,
+not one per 2MB.  So the rule is to seal more often than `rollover_txns`, and
+a cadence longer than it leaves conversions on the write path.
+
+**And do not seal frequently with the cascade armed.** Sealing every 500 with
+repacks still on the write path takes total rewriting from 3.2x of stored to
+**4.3x** (40 conversions and 14 repacks against 19 and 6), because more,
+smaller generations mean more to merge.  The combination that works is all
+three together: `zs_norepack=1`, seal from idle, and a bounded catch-up from
+idle.
+
+Two honest limits.  `max` is not a usable statistic here -- it swings 0.4 to
+5.5ms across arms on an unquiesced laptop and is OS noise; `p99.9` is the one
+that moves consistently.  And this is APFS, where `unlink` is free and it is
+~1ms on the production pool, so both the frequency and the height of these
+outliers should grow on ZFS.  `prodrun.sh`'s `latency` phase runs all three
+arms on both datasets.
+
+A measurement bug worth recording, because it produced exactly the result the
+fixture was built to look for: the first version sealed inside the loop and
+sampled the counters afterwards, charging the seal's conversion to whichever
+commit preceded it.  That read as "40 merging commits with a p50 of 24us" --
+merging commits as fast as ordinary ones, which is impossible and was believed
+for several minutes.  Attribution now happens before the seal, with a
+re-baseline after it.
+
+So the delayed-work recipe, for a caller that commits per message and has no
+threads: open with `zs_norepack=1`, and from the post-response slot call
+`sqlite3ZsSeal()` at least once per `rollover_txns` commits and
+`sqlite3ZsRepackCatchUp()` with a small bound.  That is two calls and no
+thread.  If a thread is wanted anyway, library 2.9.0's header now says a handle
+is NOT thread-safe and that a second thread with its OWN handle is supported,
+excluding the first exactly as a second process would (C-1j, G-5).
 
 `sqlite3ZsRepackCatchUp()` takes an `nMaxMerges` bound and returns whether more
 work remains, so a caller with a latency budget can do one merge per idle slot

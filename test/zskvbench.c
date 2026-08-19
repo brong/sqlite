@@ -189,6 +189,10 @@ static void insert_n(sqlite3 *db, char *val, int per){
 #ifdef SQLITE_ZEROSKIP
 extern int sqlite3ZsStats(sqlite3*, const char*, sqlite3_uint64*, int);
 extern int sqlite3ZsRepackCatchUp(sqlite3*, const char*, int, int*, int*);
+extern int sqlite3ZsSeal(sqlite3*, const char*);
+static int seal_now(sqlite3 *db){
+  return sqlite3ZsSeal(db, 0)==SQLITE_OK;
+}
 static int grab_rewrites(sqlite3 *db, sqlite3_uint64 *a){
   return sqlite3ZsStats(db, 0, a, 8)==SQLITE_OK;
 }
@@ -229,6 +233,7 @@ static int grab_rewrites(sqlite3 *db, sqlite3_uint64 *a){
 static double catch_up(sqlite3 *db, int *pnMerges){
   (void)db; if( pnMerges ) *pnMerges = 0; return 0.0;
 }
+static int seal_now(sqlite3 *db){ (void)db; return 0; }
 #endif
 
 /* `stored` is KEY+VALUE bytes, which is not what the library counts as a
@@ -266,6 +271,9 @@ static void print_rewrites(const sqlite3_uint64 *a, double stored){
 ** the write path -- that difference is what a background repack would buy, and
 ** it is the number to have before adding a thread to a process that has none. */
 static int nLatency = 0;           /* --latency N: N single-record commits */
+static int sealEvery = 0;          /* --seal-every N: zs_db_seal from "idle"
+                                   ** every N commits, untimed, to price the
+                                   ** conversion outlier away */
 
 static int cmp_double(const void *a, const void *b){
   double x = *(const double*)a, y = *(const double*)b;
@@ -331,6 +339,11 @@ static void bench_latency(int n){
     sqlite3_reset(pIns);
     aAll[i] = dt;
     tTotal += dt;
+    /* Attribute BEFORE sealing.  The first version of this sealed here and
+    ** sampled the counters afterwards, which charged the seal's conversion to
+    ** the commit that happened to precede it -- and the result looked
+    ** wonderful: 40 "merged" commits with a p50 of 24us, i.e. exactly the
+    ** number the fixture was supposed to be proving. */
     if( bStats && grab_rewrites(db, aAfter) ){
       /* aOut[0] repacks, aOut[4] conversions -- either one means this commit
       ** did file-lifecycle work the next one will not. */
@@ -342,6 +355,14 @@ static void bench_latency(int n){
       memcpy(aBefore, aAfter, sizeof(aBefore));
     }else{
       aPlain[nPlain++] = dt;
+    }
+    /* The idle moment, simulated: untimed, and after attribution, because the
+    ** whole proposition is that the work still happens and merely stops
+    ** happening on a commit a user is waiting for.  Re-baseline afterwards so
+    ** the seal is not charged to the NEXT commit either. */
+    if( sealEvery>0 && (i % sealEvery)==(sealEvery-1) ){
+      seal_now(db);
+      if( bStats ) grab_rewrites(db, aBefore);
     }
   }
   sqlite3_finalize(pIns);
@@ -597,6 +618,8 @@ int main(int argc, char **argv){
       zInit = argv[++i];
     }else if( !strcmp(argv[i], "--uri") && i+1<argc ){
       zUri = argv[++i];
+    }else if( !strcmp(argv[i], "--seal-every") && i+1<argc ){
+      sealEvery = atoi(argv[++i]);
     }else if( !strcmp(argv[i], "--latency") && i+1<argc ){
       nLatency = atoi(argv[++i]);
       reps = 1;                  /* a distribution over one pass; "best of N"
@@ -623,7 +646,7 @@ int main(int argc, char **argv){
                       " [--reps N] [--init SQL] [--uri PARAMS] [--vacuum]"
                       " [--rowid] [--random] [--only N] [--defer-repack]"
                       " [--opens N] [--build-uri PARAMS] [--opens-per N]"
-                      " [--latency N]\n");
+                      " [--latency N] [--seal-every N]\n");
       return 2;
     }
   }

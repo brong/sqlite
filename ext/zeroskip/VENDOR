@@ -1,5 +1,40 @@
-source: 4e8a374
-date: 2026-08-19 (library 2.8.0, and 2.7.0/2.6.0 with it.
+source: a19ecce
+date: 2026-08-19 (library 2.9.0, and 2.8.0/2.7.0/2.6.0 with it.
+
+      THE MERGE PATH HINTS THE KERNEL (2.9.0): one
+      posix_madvise(POSIX_MADV_WILLNEED) per input in both merge paths, from
+      our call graph showing 11.6% of a bulk load in page faults under
+      XXH3_hashLong -- the verify pass that opens a conversion or a repack,
+      dominated by servicing one fault per page rather than by hashing.
+      WILLNEED not SEQUENTIAL deliberately: C-4c shares an immutable file's
+      mapping between snapshots, so SEQUENTIAL would change eviction policy
+      under a concurrent point-lookup reader.  Advisory and unmeasurable on
+      APFS, where the pages are already resident.
+
+      THREAD SAFETY IS NOW IN THE HEADER (G-5), which is what we asked for.  A
+      handle is NOT thread-safe -- two threads on one handle is caller error,
+      and there is no internal mutex.  A second thread with its OWN handle is
+      supported and excludes the first exactly as a second process would
+      (C-1j), so a background repack thread blocks or gets ZS_LOCKED, never
+      corrupts.  Two gotchas we checked ourselves against and pass: a cursor
+      from zs_db_begin_cursor WITHOUT ZS_SHARED holds the write lock for its
+      whole life (we never call it -- every cursor comes from
+      zs_txn_begin_cursor on a transaction we already own, and read
+      transactions pass the shared flag), and locks are ordered within one
+      database so a caller holding several needs its own order (C-1h; see
+      sqlite3ZsSeal's neighbours in btree_zs.h for where ATTACH leaves us).
+
+      zs_db_seal IS THE CONVERSION LATENCY LEVER, and we had missed it.
+      ZS_NOAUTOREPACK moves repacks off the write path and leaves CONVERSIONS
+      on it, which is most of the tail: 19 of 25 slow commits survive
+      disarming the cascade.  Sealing from idle preempts them.  Exposed as
+      sqlite3ZsSeal (btree_zs.h) and measured -- see the doc's latency
+      section: seal more often than rollover_txns (1024 by default, and at one
+      record per transaction that bound is what seals a generation, not the
+      byte bound) and the merging-commit class disappears entirely rather than
+      merely shrinking.
+
+      Also 2.8.0, and 2.7.0/2.6.0 with it.
 
       A LARGE ROLLOVER IS NO LONGER PUNISHED BY THE PRIVATE INDEX (2.8.0).
       Each delta->base merge in the active file's in-memory index is
