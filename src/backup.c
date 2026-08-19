@@ -12,6 +12,7 @@
 ** This file contains the implementation of the sqlite3_backup_XXX() 
 ** API functions and the related features.
 */
+#ifndef SQLITE_ZEROSKIP /* entire file replaced by backup_zs.c when defined */
 #include "sqliteInt.h"
 #include "btreeInt.h"
 
@@ -794,3 +795,4 @@ copy_finished:
   return rc;
 }
 #endif /* SQLITE_OMIT_VACUUM */
+#endif /* !defined(SQLITE_ZEROSKIP) */

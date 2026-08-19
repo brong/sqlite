@@ -543,7 +543,7 @@ LIBOBJS0 = alter.o analyze.o attach.o auth.o \
          vdbe.o vdbeapi.o vdbeaux.o vdbeblob.o vdbemem.o vdbesort.o \
          vdbetrace.o vdbevtab.o vtab.o \
          wal.o walker.o where.o wherecode.o whereexpr.o \
-         window.o
+         window.o zeroskip.o btree_zs.o backup_zs.o zskey.o
 LIBOBJS = $(LIBOBJS0)
 
 #
@@ -1187,6 +1187,25 @@ btmutex.o:	$(TOP)/src/btmutex.c $(DEPS_OBJ_COMMON)
 
 btree.o:	$(TOP)/src/btree.c $(DEPS_OBJ_COMMON) $(TOP)/src/pager.h
 	$(T.cc.sqlite) -c $(TOP)/src/btree.c
+
+# zeroskip.c is C99 but uses POSIX (PATH_MAX, nanosleep, strdup,
+# realpath, fdatasync), which glibc hides under a strict -std=c99.
+# Upstream's own Makefile compiles it with these feature-test macros;
+# keep them in step.  _DARWIN_C_SOURCE is inert on Linux and vice
+# versa, so no platform detection is needed here.
+ZS_POSIX_FLAGS = -std=c99 -D_GNU_SOURCE -D_DARWIN_C_SOURCE
+
+zeroskip.o:	$(TOP)/ext/zeroskip/zeroskip.c $(TOP)/ext/zeroskip/zeroskip.h
+	$(T.cc.sqlite) $(ZS_POSIX_FLAGS) -I$(TOP)/ext/zeroskip -c $(TOP)/ext/zeroskip/zeroskip.c
+
+btree_zs.o:	$(TOP)/src/btree_zs.c $(DEPS_OBJ_COMMON) $(TOP)/src/pager.h $(TOP)/ext/zeroskip/zeroskip.h
+	$(T.cc.sqlite) -I$(TOP)/ext/zeroskip -c $(TOP)/src/btree_zs.c
+
+backup_zs.o:	$(TOP)/src/backup_zs.c $(DEPS_OBJ_COMMON) $(TOP)/ext/zeroskip/zeroskip.h
+	$(T.cc.sqlite) -I$(TOP)/ext/zeroskip -c $(TOP)/src/backup_zs.c
+
+zskey.o:	$(TOP)/src/zskey.c $(TOP)/src/zskey.h $(DEPS_OBJ_COMMON)
+	$(T.cc.sqlite) -c $(TOP)/src/zskey.c
 
 build.o:	$(TOP)/src/build.c $(DEPS_OBJ_COMMON)
 	$(T.cc.sqlite) -c $(TOP)/src/build.c
@@ -2169,6 +2188,17 @@ sqlite3$(T.exe):	shell.c sqlite3.c
 	$(T.link) -o $@ \
 		shell.c sqlite3.c \
 		$(sqlite3-shell-static.flags.$(STATIC_CLI_SHELL)) \
+		$(CFLAGS.readline) $(SHELL_OPT) $(CFLAGS.icu) \
+		$(LDFLAGS.libsqlite3) $(LDFLAGS.readline)
+
+#
+# Shell linked against the (non-amalgamation) static library rather than
+# sqlite3.c, for storage-engine swaps such as SQLITE_ZEROSKIP which are
+# only supported in non-amalgamation builds.
+#
+sqlite3zs$(T.exe):	shell.c $(libsqlite3.LIB)
+	$(T.link) -o $@ \
+		shell.c $(libsqlite3.LIB) \
 		$(CFLAGS.readline) $(SHELL_OPT) $(CFLAGS.icu) \
 		$(LDFLAGS.libsqlite3) $(LDFLAGS.readline)
 #

@@ -13,6 +13,7 @@
 ** See the header comment on "btreeInt.h" for additional information.
 ** Including a description of file format and an overview of operation.
 */
+#ifndef SQLITE_ZEROSKIP /* entire file replaced by btree_zs.c when defined */
 #include "btreeInt.h"
 
 /*
@@ -11631,3 +11632,4 @@ int sqlite3BtreeConnectionCount(Btree *p){
 #if defined(__GNUC__) && __GNUC__>=11
 # pragma GCC diagnostic pop
 #endif
+#endif /* !defined(SQLITE_ZEROSKIP) */
