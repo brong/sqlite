@@ -2214,6 +2214,29 @@ zskey-test$(T.exe):	$(TOP)/test/zskey-test.c $(libsqlite3.LIB)
 zsbtree-test$(T.exe):	$(TOP)/test/zsbtree-test.c $(libsqlite3.LIB)
 	$(T.cc.sqlite) -I$(TOP)/ext/zeroskip -o $@ \
 		$(TOP)/test/zsbtree-test.c $(libsqlite3.LIB) $(LDFLAGS.libsqlite3)
+
+speedtest1zs$(T.exe):	$(TOP)/test/speedtest1.c $(libsqlite3.LIB)
+	$(T.link) $(ST_OPT) -o $@ -I. -I$(TOP)/src \
+		$(TOP)/test/speedtest1.c $(libsqlite3.LIB) $(LDFLAGS.libsqlite3)
+
+zskvbench$(T.exe):	$(TOP)/test/zskvbench.c $(libsqlite3.LIB)
+	$(T.link) -o $@ -I. -I$(TOP)/src \
+		$(TOP)/test/zskvbench.c $(libsqlite3.LIB) $(LDFLAGS.libsqlite3)
+
+#
+# The same benchmark linked against the stock btree engine (always the
+# amalgamation, which never contains the zeroskip engine), and upstream
+# zeroskip's own zsbench built from the vendored sources.  Together with
+# zskvbench these give the three-way comparison driven by
+# test/zs/kvbench-all.sh.
+#
+zskvbenchstock$(T.exe):	$(TOP)/test/zskvbench.c sqlite3.c
+	$(T.link) -o $@ -I. \
+		$(TOP)/test/zskvbench.c sqlite3.c $(LDFLAGS.libsqlite3)
+
+zsbench$(T.exe):	$(TOP)/ext/zeroskip/zsbench.c $(TOP)/ext/zeroskip/zeroskip.c
+	$(T.compile) $(ZS_POSIX_FLAGS) -I$(TOP)/ext/zeroskip -o $@ \
+		$(TOP)/ext/zeroskip/zsbench.c $(TOP)/ext/zeroskip/zeroskip.c
 #
 # Build sqlite3$(T.exe) by default except in wasi-sdk builds.  Yes, the
 # semantics of 0 and 1 are confusingly swapped here.
