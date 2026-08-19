@@ -1,0 +1,16 @@
+1|ONE
+3|three
+1|ONE
+2|two
+1|ONE
+2|two
+Error near line 19: UNIQUE constraint failed: u.x
+1
+2
+3
+10
+20
+30
+2
+2
+1

@@ -1,0 +1,32 @@
+2
+5
+3
+alpha
+alpha
+bravo
+2
+5
+Error near line 11: UNIQUE constraint failed: t.c
+5
+6
+x|1
+x|2
+y|9
+1
+2
+x|1
+x|2
+y|19
+2
+2
+19
+5
+2
+5
+1|delta
+3|Charlie
+4|bravo
+5|alpha
+7|echo
+Error near line 35: FOREIGN KEY constraint failed
+1

@@ -2201,6 +2201,19 @@ sqlite3zs$(T.exe):	shell.c $(libsqlite3.LIB)
 		shell.c $(libsqlite3.LIB) \
 		$(CFLAGS.readline) $(SHELL_OPT) $(CFLAGS.icu) \
 		$(LDFLAGS.libsqlite3) $(LDFLAGS.readline)
+
+#
+# Test harnesses for the zeroskip storage engine.  They call SQLite
+# internals directly, which works because the non-amalgamation library
+# exports them.  Build with the same OPTIONS as the library.
+#
+zskey-test$(T.exe):	$(TOP)/test/zskey-test.c $(libsqlite3.LIB)
+	$(T.cc.sqlite) -I$(TOP)/ext/zeroskip -o $@ \
+		$(TOP)/test/zskey-test.c $(libsqlite3.LIB) $(LDFLAGS.libsqlite3)
+
+zsbtree-test$(T.exe):	$(TOP)/test/zsbtree-test.c $(libsqlite3.LIB)
+	$(T.cc.sqlite) -I$(TOP)/ext/zeroskip -o $@ \
+		$(TOP)/test/zsbtree-test.c $(libsqlite3.LIB) $(LDFLAGS.libsqlite3)
 #
 # Build sqlite3$(T.exe) by default except in wasi-sdk builds.  Yes, the
 # semantics of 0 and 1 are confusingly swapped here.
