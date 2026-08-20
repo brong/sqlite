@@ -515,11 +515,13 @@ static int zsbtEnsureOpen(Btree *p){
   ** start a new generation, which is the only way the file count grows.
   **
   ** The reason recorded here used to be "C-1d orders repack before write, so
-  ** the merge cannot hold the write lock".  That justification is dead: C-1d
-  ** was reversed to write -> repack, so a commit holding the write lock could
-  ** now take the repack lock in order.  Running at BEGIN is still the better
-  ** placement -- a merge inside a commit's write lock holds it for the merge's
-  ** duration -- but that is a latency argument, not a structural one.  That trigger is narrower and better placed than the
+  ** the merge cannot hold the write lock".  That died when C-1d reversed to
+  ** write -> repack: a commit CAN now take the repack lock in order, and
+  ** C-1l's compacting seal does exactly that.  The real reason is that the
+  ** cascade is UNBOUNDED (D-16b) -- taking repack from inside a commit would
+  ** hold the WRITE lock across an unbounded merge and block every other
+  ** writer for its whole duration.  At BEGIN nothing is held, so the merge
+  ** runs under the repack lock alone.  That trigger is narrower and better placed than the
   ** engine's old post-commit "repack whenever two files could merge",
   ** which fired on nearly every commit and spent write throughput to buy
   ** a read latency the workload had not asked for. */

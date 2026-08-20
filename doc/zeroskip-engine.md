@@ -163,11 +163,13 @@ from the first engine commit rather than a decision, and it spent write
 throughput on a read latency nothing had asked for.  The library's
 trigger is narrower (only when a transaction is about to start a new
 generation) and better placed (at BEGIN, where nothing is held yet).  The
-reason given here used to be structural -- "C-1d orders repack before write,
-so the merge cannot hold the write lock" -- and that is no longer true: C-1d
-was reversed to write -> repack, so a commit could now take the repack lock in
-order.  BEGIN is still the right place, but because a merge inside a commit's
-write lock would hold it for the merge's duration, which is a latency argument.
+reason given here used to be structural -- "C-1d orders repack before write, so
+the merge cannot hold the write lock" -- and it died when C-1d reversed to
+write -> repack, since a commit can now take the repack lock in order and
+C-1l's compacting seal does.  The reason that survives is that **the cascade is
+unbounded** (D-16b): taking repack inside a commit would hold the WRITE lock
+across an unbounded merge and block every other writer for its duration.  At
+BEGIN nothing is held, so the merge runs under the repack lock alone.
 Measured, the change is neutral within noise on stores, fetches and
 scans; what it buys is one policy instead of two.  File counts stay
 bounded -- 20000 single-row commits leave three data files, re-checked on

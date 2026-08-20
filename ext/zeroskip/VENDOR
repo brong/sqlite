@@ -1,4 +1,4 @@
-source: e56196e
+source: 0e07b3a
 date: 2026-08-19 (library 2.9.1, and 2.9.0/2.8.0/2.7.0/2.6.0 with it.
 
       THE LOCK PROTOCOL CHANGED and nothing here had to move, but two of our
@@ -28,11 +28,19 @@ date: 2026-08-19 (library 2.9.1, and 2.9.0/2.8.0/2.7.0/2.6.0 with it.
       but for a latency reason -- a merge inside a commit's write lock holds it
       for the merge's duration.
 
-      Three sites upstream still carry the old direction; reported back, not
-      patched here (we do not edit vendored source): zeroskip.c:4971 describes
-      a three-lock total order including remove, zeroskip.c:7250 and
-      doc/specification.md:1121 both still say "C-1d orders repack BEFORE
-      write: a commit ... structurally cannot take the repack lock."
+      All three stale sites we reported are fixed in 0e07b3a, and the
+      corrected reason is better than the one we had written for ourselves:
+      the cascade runs at BEGIN not because a commit cannot take the repack
+      lock (it can) but because the cascade is UNBOUNDED (D-16b), so taking
+      repack inside a commit would hold the WRITE lock across an unbounded
+      merge and block every other writer for its duration.  Our two sites now
+      say that.
+
+      0e07b3a is COMMENTS ONLY, verified rather than read off the diff:
+      stripping debug info from zeroskip.o built either side gives
+      byte-identical objects.  Comparing the unstripped .o says "differs",
+      because -g embeds line numbers and a comment shifts them -- which nearly
+      got reported here as a code change.
 
       2.9.1 itself is the doc fixes and the two-thread test: rollover_txns no
       longer claims an index_dir handle is exempt from the span bound (untrue
