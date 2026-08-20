@@ -1,4 +1,4 @@
-source: 0e07b3a
+source: ffbb7e1
 date: 2026-08-19 (library 2.9.1, and 2.9.0/2.8.0/2.7.0/2.6.0 with it.
 
       THE LOCK PROTOCOL CHANGED and nothing here had to move, but two of our
@@ -118,6 +118,21 @@ date: 2026-08-19 (library 2.9.1, and 2.9.0/2.8.0/2.7.0/2.6.0 with it.
       transactions pass the shared flag), and locks are ordered within one
       database so a caller holding several needs its own order (C-1h; see
       sqlite3ZsSeal's neighbours in btree_zs.h for where ATTACH leaves us).
+
+      UPSTREAM REWROTE THE SEAL CADENCE ADVICE (ffbb7e1, header comments only;
+      verified by stripping debug info -- the objects are byte-identical), and
+      measured from their side the mechanism we could only infer from ours.
+      Against the two layouts our run produced -- 196 files with no cadence,
+      400 with one every 500 commits -- a point lookup is 24% slower on a HIT
+      and 40% slower on a MISS, three passes, no overlap.  The miss number is
+      the one that applies to us: zsbtWrite probes before every insert of a new
+      key, so a probe-then-insert caller pays the worse figure on every commit.
+      The header now says a cadence is a file-count knob first and a latency
+      knob second, names the disarmed-cascade pairing as the thing not to do,
+      and calls seal a bulk-import and maintenance tool rather than a
+      steady-state mode.  Their old text prescribed exactly the pairing we then
+      measured as a 73% throughput loss, from a fixture of ours too small to
+      show it.
 
       zs_db_seal: RETRACTED ON ZFS.  Our laptop measurement said sealing from
       idle removes the merging-commit class for free; production says it costs

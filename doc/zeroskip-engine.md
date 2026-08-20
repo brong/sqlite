@@ -1059,9 +1059,14 @@ a cadence longer than it leaves conversions on the write path.
 **And do not seal frequently with the cascade armed.** Sealing every 500 with
 repacks still on the write path takes total rewriting from 3.2x of stored to
 **4.3x** (40 conversions and 14 repacks against 19 and 6), because more,
-smaller generations mean more to merge.  The combination that works is all
-three together: `zs_norepack=1`, seal from idle, and a bounded catch-up from
-idle.
+smaller generations mean more to merge.
+
+At this point the laptop suggested the combination of all three -- `zs_norepack`,
+seal from idle, bounded catch-up -- and **that recommendation is retracted two
+sections down, on production.** It is left standing here only so the fixture
+that produced it is visible: pairing a tight cadence with a disarmed cascade
+accumulates files, and nothing at 20000 records on APFS can see what that
+costs.
 
 Two honest limits.  `max` is not a usable statistic here -- it swings 0.4 to
 5.5ms across arms on an unquiesced laptop and is OS noise; `p99.9` is the one
@@ -1096,6 +1101,15 @@ records on APFS the file count stays small and `unlink` is free, so neither cost
 appears; at 200000 records on a pool where `unlink` is ~1ms, both do.  The
 fixture that produced the recommendation was too small to contain its own
 refutation -- the same shape as the recordsize finding that opens this document.
+
+**Upstream then measured the mechanism directly, which this engine could only
+infer from the outside.** Against the two layouts -- 196 files with no cadence,
+400 with one every 500 commits -- a point lookup is **24% slower on a hit and
+40% slower on a MISS**, three passes with no overlap.  The miss figure is ours:
+`zsbtWrite`'s probe is a miss on every insert of a new key, so a probe-then-
+insert caller pays the worse of the two on every single commit.  That is the
+whole of the -73% throughput above, arriving from their side as a cause rather
+than from ours as a correlation.
 
 **So the deployment answer for a per-message writer is the DEFAULT**: cascade
 armed, no `zs_norepack`, no seal cadence.  The tail is real (0.13% of commits,
