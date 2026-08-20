@@ -1,7 +1,44 @@
-source: d732ee4
-date: 2026-08-19 (library 2.9.0, and 2.8.0/2.7.0/2.6.0 with it.  d732ee4 is
-      a19ecce plus a two-thread test and two header-comment fixes; the only
-      vendored change is zeroskip.h, all documentation.
+source: e56196e
+date: 2026-08-19 (library 2.9.1, and 2.9.0/2.8.0/2.7.0/2.6.0 with it.
+
+      THE LOCK PROTOCOL CHANGED and nothing here had to move, but two of our
+      own comments were wrong afterwards.
+
+      The remove lock (byte 2) is GONE: every removal is justified by a file
+      the remover published beforehand whose range encloses the candidate, and
+      enclosure is transitive, so removals commute.  D-23's precondition is
+      restated in local form (is THIS candidate enclosed by a file that is not
+      itself going away) because a set-wide predicate only looked like it
+      raced.  Byte 2 is reserved rather than reused, so a peer still taking it
+      interoperates and contends with nobody.
+
+      C-1d REVERSED to write -> repack, asserted in zsi_lock_take.  Upstream
+      calls the order interoperability surface and took the reversal with no
+      version bump under F-7a, since nothing on disk changes -- a defensible
+      call for a pre-release library, and stated rather than quiet.
+
+      Nothing in this engine takes a zeroskip lock directly, so the change is
+      invisible to us at runtime: busy-test, backup-concurrent, twowriter and
+      crash-test are all clean, run repeatedly because locking is what moved.
+      What DID need fixing is a rationale we had copied from upstream's old
+      direction, in btree_zs.c and in the doc: "the cascade runs at BEGIN
+      because C-1d orders repack before write, so the merge cannot hold the
+      write lock."  Under write -> repack a commit could now take the repack
+      lock in order, so the structural argument is dead.  BEGIN is still right,
+      but for a latency reason -- a merge inside a commit's write lock holds it
+      for the merge's duration.
+
+      Three sites upstream still carry the old direction; reported back, not
+      patched here (we do not edit vendored source): zeroskip.c:4971 describes
+      a three-lock total order including remove, zeroskip.c:7250 and
+      doc/specification.md:1121 both still say "C-1d orders repack BEFORE
+      write: a commit ... structurally cannot take the repack lock."
+
+      2.9.1 itself is the doc fixes and the two-thread test: rollover_txns no
+      longer claims an index_dir handle is exempt from the span bound (untrue
+      since P-13, and it is the field a caller reads to pick a seal cadence),
+      and zs_db_seal carries our 500-vs-4000 cadence measurement and the
+      cascade-armed interaction.
 
       ONE OF THOSE FIXES MATTERS TO US AND WE ARE CLEAN ON IT.  rollover_txns
       used to say "A handle with index_dir set is already bounded by P-13 and

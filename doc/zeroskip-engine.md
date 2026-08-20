@@ -162,8 +162,12 @@ so nearly every commit that rolled a generation -- which was scaffolding
 from the first engine commit rather than a decision, and it spent write
 throughput on a read latency nothing had asked for.  The library's
 trigger is narrower (only when a transaction is about to start a new
-generation) and better placed (at BEGIN, where nothing is held: C-1d
-orders repack before write so the merge cannot hold the write lock).
+generation) and better placed (at BEGIN, where nothing is held yet).  The
+reason given here used to be structural -- "C-1d orders repack before write,
+so the merge cannot hold the write lock" -- and that is no longer true: C-1d
+was reversed to write -> repack, so a commit could now take the repack lock in
+order.  BEGIN is still the right place, but because a merge inside a commit's
+write lock would hold it for the merge's duration, which is a latency argument.
 Measured, the change is neutral within noise on stores, fetches and
 scans; what it buys is one policy instead of two.  File counts stay
 bounded -- 20000 single-row commits leave three data files, re-checked on

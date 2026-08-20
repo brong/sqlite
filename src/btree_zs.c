@@ -511,10 +511,15 @@ static int zsbtEnsureOpen(Btree *p){
     setup.flags |= ZS_CREATE;
   }
   /* The library's own cascade (D-16e) is left ARMED.  It runs at BEGIN,
-  ** where nothing is held -- C-1d orders repack before write precisely so
-  ** the merge cannot hold the write lock -- and only when the transaction
-  ** is about to start a new generation, which is the only way the file
-  ** count grows.  That trigger is narrower and better placed than the
+  ** where nothing is held yet, and only when the transaction is about to
+  ** start a new generation, which is the only way the file count grows.
+  **
+  ** The reason recorded here used to be "C-1d orders repack before write, so
+  ** the merge cannot hold the write lock".  That justification is dead: C-1d
+  ** was reversed to write -> repack, so a commit holding the write lock could
+  ** now take the repack lock in order.  Running at BEGIN is still the better
+  ** placement -- a merge inside a commit's write lock holds it for the merge's
+  ** duration -- but that is a latency argument, not a structural one.  That trigger is narrower and better placed than the
   ** engine's old post-commit "repack whenever two files could merge",
   ** which fired on nearly every commit and spent write throughput to buy
   ** a read latency the workload had not asked for. */
