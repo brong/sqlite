@@ -63,14 +63,19 @@ date: 2026-08-19 (library 2.9.1, and 2.9.0/2.8.0/2.7.0/2.6.0 with it.
       stated upstream rather than rediscovered per caller.
 
       THE WILLNEED HINT IS MEASURED AND IT WORKS (2026-08-20, ZFS 128K, 2M
-      records, three alternating passes per arm): major faults 126109 ->
-      122482, -3627 (-2.9%), IDENTICAL TO THE UNIT within each arm across all
-      three passes.  Minor faults rise 247 while major falls 3627, so most of
-      those faults stop happening rather than getting cheaper -- consistent
-      with readahead plus fault-around mapping a run per fault, offered as
-      mechanism and not measured.  Time 1.987 -> 1.953s (-1.7%), consistent
-      with 3627 faults at the 15.9us each this run implies but only one printed
-      digit apart, so the fault count is the result and the clock corroborates.
+      records, TWO runs of three alternating passes each): major faults 126109
+      -> 122482, -3627 (-2.9%), IDENTICAL TO THE UNIT -- six samples per arm,
+      two independent runs, two fresh builds of each arm.  Minor faults rise
+      ~612 while major falls 3627, so most of those faults stop happening
+      rather than getting cheaper: consistent with readahead plus fault-around
+      mapping a run per fault, offered as mechanism and not measured, and the
+      magnitude varies fourfold run to run so only the sign is a finding.
+      NO TIMING SIGNAL: after one run the arms looked just separable and we
+      said the clock corroborated; pooled over twelve samples the hint arm's
+      range encloses the other's and holds both the fastest and slowest
+      samples.  3015 net faults avoided at 15.9us is 48ms, 2.4% of a 1.99s
+      run, against +/-0.5% noise on the quiet arm -- real and below this
+      fixture's resolution.  The fault count is the whole result.
       2.9% is a FLOOR: with the ARC warm every fault is a memory hit, and the
       asynchronous-issue benefit that matters on a cold pool is what this
       fixture cannot exercise.  Upstream's condition for deleting the call is

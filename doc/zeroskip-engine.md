@@ -951,26 +951,47 @@ Measured 2026-08-20 on ZFS at 128K, 2M records, three passes per arm with the
 order alternating.  Upstream's position was that if it did not show here it had
 no justification left and should come out.  It shows.
 
-                   major faults      minor      cold catch-up
-    nohint            126109         ~6430      1.98 / 2.00 / 1.98 s
-    hint              122482         ~6677      1.92 / 1.97 / 1.97 s
-                      -3627 (-2.9%)  +247       means 1.987 -> 1.953 (-1.7%)
+Two runs, six samples per arm, arms rebuilt from git each time:
 
-**The fault counts are identical to the unit within each arm across three
-passes** -- 126109 three times, 122482 three times -- which makes this the
-least noisy number this project has produced and is why the phase was built to
-read faults before the clock.  The time difference is consistent rather than
-independently strong: 3627 faults at the 15.9us/fault this run implies is 58ms
-against 33ms measured, same order, and the arms differ by one printed digit.
+                   major faults        minor        cold catch-up
+    nohint            126109 x6        mean 6294    1.98-2.00 (spread 0.02)
+    hint              122482 x6        mean 6906    1.92-2.02 (spread 0.10)
+                      -3627 (-2.9%)    +612         means 1.987 -> 1.965
 
-**Minor faults go UP by 247 while major falls by 3627, so most of those faults
-did not happen at all** rather than becoming cheap.  That is what readahead plus
+**The major-fault count is identical to the unit -- 126109 six times, 122482
+six times, across two independent runs and two fresh builds of each arm.** That
+is the least noisy measurement this project has produced, and it is the whole
+result.
+
+**The timing claim from the first run does not survive the second, and I am
+withdrawing it.** After one run the arms looked just separable (1.98-2.00
+against 1.92-1.97) and this section said the clock corroborated the faults.
+Pooled over twelve samples the hint arm's range *encloses* the nohint arm's, its
+spread is five times larger, and it holds both the fastest sample (1.92) and the
+slowest (2.02).  There is no timing signal here.  The arithmetic says why there
+could not be: 3015 net faults avoided at 15.9us is 48ms, 2.4% of a 1.99s run,
+against timing noise of +/-0.5% on the quiet arm and far more on the other --
+the effect is real and simply below this fixture's timing resolution.  A
+one-run "just non-overlapping by one printed digit" was exactly the shape that
+a fixed arm order manufactured earlier in this document, and the second run is
+the only reason it did not get written down as a result.
+
+**Minor faults go UP by 612 on average while major falls by 3627, so most of
+those faults did not happen at all** rather than becoming cheap.  The sign is
+consistent across all six pairs; the magnitude varies fourfold between runs
+(+247 and +976), so treat the direction as the finding and not the size.  That is what readahead plus
 fault-around would do: `POSIX_MADV_WILLNEED` populates a run of pages, and
 `filemap_map_pages` then maps the run on one fault instead of taking one per
 page.  Offered as the mechanism consistent with the counts, not as something
 measured -- the standing lesson in this document is that a plausible mechanism
 fitted to a number is how three earlier explanations got written down and
 retracted.
+
+**So the result is a deterministic 2.9% fewer major faults and nothing the
+clock can see, which is a stronger claim than it sounds:** an effect that
+reproduces to the unit across two runs is established, and one that needs a
+1.99s stopwatch to resolve 48ms is not measurable here whether or not it is
+real.
 
 **And 2.9% is a floor, for the reason the script's own header gives.** With the
 ARC warm every one of those faults is a memory hit at 15.9us; on a genuinely
