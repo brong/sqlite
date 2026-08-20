@@ -945,6 +945,41 @@ than ARC, neither of which belongs in a script pointed at a production box.  So
 if the effect shows, it is real; if it does not, that is evidence and not proof,
 and the next step is a dataset bigger than ARC rather than deleting the call.
 
+#### The hint works: 2.9% fewer major faults, deterministic
+
+Measured 2026-08-20 on ZFS at 128K, 2M records, three passes per arm with the
+order alternating.  Upstream's position was that if it did not show here it had
+no justification left and should come out.  It shows.
+
+                   major faults      minor      cold catch-up
+    nohint            126109         ~6430      1.98 / 2.00 / 1.98 s
+    hint              122482         ~6677      1.92 / 1.97 / 1.97 s
+                      -3627 (-2.9%)  +247       means 1.987 -> 1.953 (-1.7%)
+
+**The fault counts are identical to the unit within each arm across three
+passes** -- 126109 three times, 122482 three times -- which makes this the
+least noisy number this project has produced and is why the phase was built to
+read faults before the clock.  The time difference is consistent rather than
+independently strong: 3627 faults at the 15.9us/fault this run implies is 58ms
+against 33ms measured, same order, and the arms differ by one printed digit.
+
+**Minor faults go UP by 247 while major falls by 3627, so most of those faults
+did not happen at all** rather than becoming cheap.  That is what readahead plus
+fault-around would do: `POSIX_MADV_WILLNEED` populates a run of pages, and
+`filemap_map_pages` then maps the run on one fault instead of taking one per
+page.  Offered as the mechanism consistent with the counts, not as something
+measured -- the standing lesson in this document is that a plausible mechanism
+fitted to a number is how three earlier explanations got written down and
+retracted.
+
+**And 2.9% is a floor, for the reason the script's own header gives.** With the
+ARC warm every one of those faults is a memory hit at 15.9us; on a genuinely
+cold pool a fault is a raidz2 read and the thing readahead buys most -- issuing
+them asynchronously so the disk pipelines instead of serving one synchronous
+read per page -- is exactly what this fixture cannot exercise.  So the hint
+earns its place on the strength of a deterministic 2.9% that understates it by
+an unknown factor, and the case for deleting it is gone.
+
 #### Commit latency as a distribution, and what a background repack buys
 
 Every store number above is a rate, and a rate cannot answer the question the

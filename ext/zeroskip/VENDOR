@@ -62,7 +62,27 @@ date: 2026-08-19 (library 2.9.1, and 2.9.0/2.8.0/2.7.0/2.6.0 with it.
       rewriting 3.2x -> 4.3x of stored), so the three-lever combination is
       stated upstream rather than rediscovered per caller.
 
-      THE WILLNEED HINT IS STILL UNMEASURED, and cannot be measured on APFS or
+      THE WILLNEED HINT IS MEASURED AND IT WORKS (2026-08-20, ZFS 128K, 2M
+      records, three alternating passes per arm): major faults 126109 ->
+      122482, -3627 (-2.9%), IDENTICAL TO THE UNIT within each arm across all
+      three passes.  Minor faults rise 247 while major falls 3627, so most of
+      those faults stop happening rather than getting cheaper -- consistent
+      with readahead plus fault-around mapping a run per fault, offered as
+      mechanism and not measured.  Time 1.987 -> 1.953s (-1.7%), consistent
+      with 3627 faults at the 15.9us each this run implies but only one printed
+      digit apart, so the fault count is the result and the clock corroborates.
+      2.9% is a FLOOR: with the ARC warm every fault is a memory hit, and the
+      asynchronous-issue benefit that matters on a cold pool is what this
+      fixture cannot exercise.  Upstream's condition for deleting the call is
+      not met.
+
+      (The first run of this A/B measured NOTHING: prefetch-ab.sh chose its
+      without-hint arm by history position, which at 2.9.1 selected the commit
+      that introduced the hint, so both arms had it -- 122482 major faults
+      identical across six runs, which reads as a clean null and is a null
+      instrument.  Arm selection is by posix_madvise call count now.)
+
+      Superseded note -- the hint could not be measured on APFS or
       by any existing fixture here, because they all write the merge input and
       merge it moments later.  test/zs/prefetch-ab.sh is the measurement that
       can see it: build with the cascade disarmed, drop the page cache, then
