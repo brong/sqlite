@@ -94,6 +94,18 @@ date: 2026-08-19 (library 2.9.1, and 2.9.0/2.8.0/2.7.0/2.6.0 with it.
       database so a caller holding several needs its own order (C-1h; see
       sqlite3ZsSeal's neighbours in btree_zs.h for where ATTACH leaves us).
 
+      zs_db_seal: RETRACTED ON ZFS.  Our laptop measurement said sealing from
+      idle removes the merging-commit class for free; production says it costs
+      73% of throughput and 245% of the median, and makes p99.9 WORSE, because
+      disarming the cascade lets the file count grow and a probe is linear in
+      it (D-14d) -- 400 generations instead of 195.  The 20000-record APFS
+      fixture was too small to contain that.  The deployment answer for a
+      per-message writer is the plain default; seal and the bounded catch-up
+      remain the right tools for a bulk import only.  Upstream's zs_db_seal
+      documentation carries our cadence numbers, which are still correct for
+      what they measure -- the retraction is of our RECOMMENDATION, not of
+      their lever.
+
       zs_db_seal IS THE CONVERSION LATENCY LEVER, and we had missed it.
       ZS_NOAUTOREPACK moves repacks off the write path and leaves CONVERSIONS
       on it, which is most of the tail: 19 of 25 slow commits survive

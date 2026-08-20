@@ -49,11 +49,20 @@ if [ "$(id -u)" != 0 ]; then
   fi
 fi
 
-# The two arms.  The current tree is the WITH-hint arm; the previous vendoring is
-# the without.  Taken from git rather than by editing the source, so the arms
-# differ by exactly one upstream commit and nothing else -- and verified with
-# cmp, because make has missed a same-second source change here before and a
-# byte-identical pair reads as "no effect".
+# The two arms.  The current tree is the WITH-hint arm; the without is the most
+# recent vendoring whose zeroskip.c CONTAINS NO posix_madvise.
+#
+# Selected by CONTENT, not by history position, because the first version of
+# this script used "the previous commit that touched zeroskip.c" and that was
+# wrong the moment an unrelated vendoring landed on top: at 2.9.1 the previous
+# touch was the commit that INTRODUCED the hint, so both arms had it and the
+# run measured nothing -- identical major-fault counts to the unit across six
+# runs, which read as a clean null result and is really a null instrument.
+#
+# The cmp guard did not catch it either, because the lock-protocol change made
+# the binaries differ in a dimension that had nothing to do with the hint.  So
+# the assertion below is on the posix_madvise COUNT (2 against 0), which is the
+# thing under test, and cmp is kept only as a build sanity check.
 say(){ printf '\n== %s\n' "$*"; }
 build_arm(){                       # build_arm <label> <treeish-or-CURRENT>
   rm -f zeroskip.o btree_zs.o libsqlite3.a zskvbench
@@ -66,18 +75,34 @@ build_arm(){                       # build_arm <label> <treeish-or-CURRENT>
   cp zskvbench "zskvbench-$1"
   git checkout -- ext/zeroskip/zeroskip.c
 }
+say "selecting the arms by content"
+NHINT=$(grep -c posix_madvise ext/zeroskip/zeroskip.c || true)
+if [ "$NHINT" -eq 0 ]; then
+  echo "ERROR: the current tree has no posix_madvise -- nothing to test." >&2
+  exit 1
+fi
+PREV=
+for c in $(git rev-list HEAD -- ext/zeroskip/zeroskip.c); do
+  if [ "$(git show "${c}:ext/zeroskip/zeroskip.c" | grep -c posix_madvise)" -eq 0 ]; then
+    PREV=$c; break
+  fi
+done
+if [ -z "$PREV" ]; then
+  echo "ERROR: no vendoring of zeroskip.c without posix_madvise -- cannot" >&2
+  echo "       form a without-hint arm.  Do NOT fall back to 'the previous" >&2
+  echo "       commit': that is how this script once compared a build to" >&2
+  echo "       itself and reported a clean null." >&2
+  exit 1
+fi
+echo "  hint   = current tree ($(sed -n 's/^source: //p' ext/zeroskip/VENDOR)), $NHINT call sites"
+echo "  nohint = $PREV, 0 call sites"
 say "building both arms"
 build_arm hint CURRENT
-PREV=$(git rev-list -1 HEAD~1 -- ext/zeroskip/zeroskip.c)
-[ -n "$PREV" ] || { echo "cannot find the previous vendoring" >&2; exit 1; }
 build_arm nohint "$PREV"
 if cmp -s zskvbench-hint zskvbench-nohint; then
   echo "ERROR: the two arms are byte-identical -- nothing was measured." >&2
   exit 1
 fi
-echo "  hint   = current tree ($(sed -n 's/^source: //p' ext/zeroskip/VENDOR))"
-echo "  nohint = $PREV"
-grep -c posix_madvise ext/zeroskip/zeroskip.c | sed 's/^/  posix_madvise call sites in the current source: /'
 
 W="$DIR/prefetch-ab"
 run_arm(){                         # run_arm <label>

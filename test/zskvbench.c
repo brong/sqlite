@@ -776,6 +776,10 @@ int main(int argc, char **argv){
   }else if( catchupOnly ){
     bench_catchup_only();
   }else if( nLatency>0 ){
+    /* The header above printed nrecs, which --latency does not use; say the
+    ** real count rather than let a production log claim 20000 commits when it
+    ** made 200000. */
+    printf("  %-34s%d single-record commits\n", "latency fixture", nLatency);
     bench_latency(nLatency);
   }else if( nOpens>0 ){
     bench_opens(nOpens);

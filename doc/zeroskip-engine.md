@@ -737,12 +737,22 @@ never runs the compress or encrypt stage.  Both engines' crypto is on a
 `z_wr_iss` taskq thread.  ZFS spawns nothing per write, either: the ZIO taskqs
 and the per-pool `txg_sync_thread` are created at pool import and parked.
 
-**That predicts something this sweep had not tested.** If the cost is
-per-BLOCK setup rather than per-byte work, a 130KB span is ~32 blocks at
-`recordsize=4K` and one or two at 128K, so the per-KB slope should mostly
-flatten at 128K.  The fsync phase now sweeps both datasets rather than only
-the first, because asserting this instead of measuring it is the exact mistake
-this section documents three times over.
+**That predicted something the sweep had not tested, and the answer is
+"directionally yes, nowhere near the predicted size".** If the cost were
+per-BLOCK setup, a 130KB span is ~32 blocks at `recordsize=4K` against one or
+two at 128K, so the slope should mostly flatten.  Measured on both datasets
+(2026-08-20, wall):
+
+    per-txn      1     10    100    200    400   1000     slope
+    4K        115us  111us  179us  236us  391us  647us   4.09us/KB
+    128K      108us  115us  153us  203us  404us  485us   2.90us/KB
+
+**29% shallower, not flat.** A 32-fold reduction in block count buys under a
+third off the slope, so per-block setup is a real term and not the dominant
+one; something else in that path scales with bytes.  This is the fourth
+mechanism offered for this row and the first that was tested before being
+believed, which is the only reason it can be reported as a partial hit rather
+than a discovery.
 
 Caveat on the profile, in both directions: `perf record` on the process sampled
 only `zskvbench` (98.13% of cycles), so it proves the crypto is not in OUR
@@ -1000,9 +1010,44 @@ idle.
 Two honest limits.  `max` is not a usable statistic here -- it swings 0.4 to
 5.5ms across arms on an unquiesced laptop and is OS noise; `p99.9` is the one
 that moves consistently.  And this is APFS, where `unlink` is free and it is
-~1ms on the production pool, so both the frequency and the height of these
-outliers should grow on ZFS.  `prodrun.sh`'s `latency` phase runs all three
-arms on both datasets.
+~1ms on the production pool.
+
+#### The seal ladder is a net loss on ZFS, and the laptop could not see why
+
+Run on production (2026-08-20, 200000 single-record commits, both recordsizes),
+the ladder above inverts.  **Retracting the recommendation.**
+
+    4K              throughput    p50     p99.9      max   merging commits
+    armed              9820/s   0.096    0.862   122.745   260 (4% of time)
+    norepack           5518/s   0.158    0.901    32.846   195 (1%)
+    + seal/500         2615/s   0.331    1.171    31.473   NONE
+
+    vs armed:       norepack  -44% tp, +65% p50, +5% p99.9
+                    +seal     -73% tp, +245% p50, +36% p99.9
+
+128K is the same shape (-74% throughput, +248% p50, +44% p99.9).  **Sealing
+removes the merging-commit class and pays for it with almost everything else:**
+a quarter of the throughput, three and a half times the median, and a p99.9 that
+gets *worse* rather than better.  The one genuine win is the extreme max, 122ms
+to 31ms -- and the armed arm's own non-merging max is 33.7ms, so that 122ms
+outlier really is a merging commit and really does go away.
+
+**Why the laptop said the opposite: file count.** `zs_norepack` stops the
+merging, so files accumulate, and point-lookup cost is linear in the file count
+(D-14d) -- every commit's `OP_NotExists` probe searches all of them.  Sealing
+every 500 commits makes it worse by turning 195 generations into 400.  At 20000
+records on APFS the file count stays small and `unlink` is free, so neither cost
+appears; at 200000 records on a pool where `unlink` is ~1ms, both do.  The
+fixture that produced the recommendation was too small to contain its own
+refutation -- the same shape as the recordsize finding that opens this document.
+
+**So the deployment answer for a per-message writer is the DEFAULT**: cascade
+armed, no `zs_norepack`, no seal cadence.  The tail is real (0.13% of commits,
+4% of total time, one 122ms outlier in 200000) but every lever that removes it
+costs more than it saves.  `sqlite3ZsSeal()` and the bounded catch-up stay --
+they are the right tools for a bulk import, where throughput during the window
+is not what matters -- and the p99.9 argument for backgrounding a repack is
+withdrawn until there is a lever that does not multiply the file count.
 
 A measurement bug worth recording, because it produced exactly the result the
 fixture was built to look for: the first version sealed inside the loop and
