@@ -884,6 +884,51 @@ Every catch-up in `zskvbench` is followed by an untimed
 `PRAGMA integrity_check`, because this is the only place in the tier that
 drives a merge from our side rather than the library's.
 
+#### The one measurement a resident fixture cannot make
+
+Library 2.9.0 added a `posix_madvise(POSIX_MADV_WILLNEED)` per merge input, on
+the strength of our own call graph: 11.6% of a bulk load was page faults under
+`XXH3_hashLong`, in the verify pass that opens a conversion or a repack.
+Upstream cannot measure it -- on APFS the input pages are resident from having
+just been written -- and their position is that if it does not show on ZFS it
+has no justification left and should come out.
+
+**Every fixture in this tree is the worst possible case for observing it**, and
+noticing that is most of the work.  They all write the merge input and merge it
+moments later, so the pages are hot; and on the production box a 260MB database
+fits in ARC many times over, so "run it on ZFS" does not fix the fixture.  An
+A/B over the existing cascade phase would measure nothing and would wrongly
+condemn the change.
+
+`test/zs/prefetch-ab.sh` is the measurement that can see it.  The phases run in
+separate processes with a cache drop between them, which is what
+`zskvbench --build-only` and `--catchup-only` exist for:
+
+    zskvbench --build-only     leave a database, cascade disarmed, files unmerged
+    echo 3 > drop_caches       page cache cold
+    zskvbench --catchup-only   time the merge alone, and count its faults
+
+**Faults are the primary reading and the clock is secondary.** The hint acts on
+faults; a fault count from `getrusage` is nearly noise-free where a wall clock
+on a shared machine is not, and this project has already read machine noise as
+a result more than once.  Both arms come from git rather than from editing the
+source, so they differ by exactly one upstream commit, and `cmp` guards against
+the byte-identical pair that once read as "no effect".  Arm order alternates,
+because a fixed order manufactured a clean-looking 2.4% here once already.
+
+**Calibrated on APFS, where it correctly reports nothing:** 14349 minor faults
+and zero major on both arms, four alternating runs, times identical to 0.01s.
+An instrument that reports no effect where no effect is possible is the
+precondition for believing it when it reports one.
+
+Two honest limits to state with any result.  `drop_caches` empties the page
+cache and not the ARC, so a fault afterwards still finds its data in ARC rather
+than on disk -- cheaper than a real cold read, so this **understates** the hint.
+Making it colder means exporting and re-importing the pool or a database larger
+than ARC, neither of which belongs in a script pointed at a production box.  So
+if the effect shows, it is real; if it does not, that is evidence and not proof,
+and the next step is a dataset bigger than ARC rather than deleting the call.
+
 #### Commit latency as a distribution, and what a background repack buys
 
 Every store number above is a rate, and a rate cannot answer the question the

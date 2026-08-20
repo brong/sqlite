@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 
 /* Sanitizers cost 3-4x and say nothing about themselves at runtime. */
 #if defined(__has_feature)
@@ -144,6 +145,29 @@ static sqlite3 *open_fresh(const char *zDir){
   return db;
 }
 
+/* Like open_fresh but keeps what is there: no cleanup, no CREATE TABLE. */
+static sqlite3 *open_existing(const char *zDir){
+  sqlite3 *db;
+  int rc;
+  if( zUri ){
+    char zFile[1400];
+    snprintf(zFile, sizeof(zFile), "file:%s?%s", zDir, zUri);
+    rc = sqlite3_open_v2(zFile, &db,
+           SQLITE_OPEN_READWRITE|SQLITE_OPEN_URI, 0);
+  }else{
+    rc = sqlite3_open(zDir, &db);
+  }
+  if( rc!=SQLITE_OK ){
+    fprintf(stderr, "open %s failed\n", zDir);
+    exit(1);
+  }
+  if( zInit && sqlite3_exec(db, zInit, 0, 0, 0)!=SQLITE_OK ){
+    fprintf(stderr, "init: %s\n", sqlite3_errmsg(db));
+    exit(1);
+  }
+  return db;
+}
+
 static void insert_n(sqlite3 *db, char *val, int per){
   sqlite3_stmt *pIns;
   int done = 0;
@@ -250,6 +274,58 @@ static void print_rewrites(const sqlite3_uint64 *a, double stored){
          stored/1e6);
 }
 
+/* Build a database with the cascade disarmed and LEAVE it, for a cold-merge
+** measurement whose cache drop has to happen in another process. */
+static void bench_build_only(void){
+  sqlite3 *db;
+  char *val = sqlite3_malloc64((sqlite3_int64)valsize);
+  double t0;
+  if( val==0 ){ fprintf(stderr, "oom\n"); exit(1); }
+  memset(val, 'x', valsize);
+  deferRepack = 1;               /* the whole point: leave the merging undone */
+  db = open_fresh(workdir);
+  t0 = now();
+  insert_n(db, val, 1000);
+  printf("  %-34s%7.0f/s  %5.2fs  (cascade disarmed, files left unmerged)\n",
+         "build", nrecs/(now()-t0), now()-t0);
+  sqlite3_close(db);
+  sqlite3_free(val);
+  /* deliberately NO cleanup: --catchup-only is the other half */
+}
+
+/* Time the merge alone, over whatever --build-only left.  Reports faults as
+** well as time, because the hint under test acts on faults. */
+static void bench_catchup_only(void){
+  sqlite3 *db;
+  struct rusage r0, r1;
+  sqlite3_uint64 aBefore[8], aAfter[8];
+  int nMerges = 0, bBehind = 0, bStats;
+  double dt;
+
+  db = open_existing(workdir);
+  bStats = grab_rewrites(db, aBefore);
+  getrusage(RUSAGE_SELF, &r0);
+  dt = catch_up(db, &nMerges);
+  getrusage(RUSAGE_SELF, &r1);
+  printf("  %-34s%5.2fs  %d merges%s\n", "cold catch-up", dt, nMerges,
+         bBehind ? " (still behind)" : "");
+  printf("  %-34sminor %llu  major %llu\n", "  page faults",
+         (unsigned long long)(r1.ru_minflt - r0.ru_minflt),
+         (unsigned long long)(r1.ru_majflt - r0.ru_majflt));
+  if( bStats && grab_rewrites(db, aAfter) ){
+    printf("  %-34s%llu repacks %.0fMB %.0fms; %llu conversions %.0fMB %.0fms\n",
+           "  merged in this process",
+           (unsigned long long)(aAfter[0]-aBefore[0]),
+           (double)(aAfter[2]-aBefore[2])/1e6,
+           (double)(aAfter[3]-aBefore[3])/1e6,
+           (unsigned long long)(aAfter[4]-aBefore[4]),
+           (double)(aAfter[6]-aBefore[6])/1e6,
+           (double)(aAfter[7]-aBefore[7])/1e6);
+  }
+  sqlite3_close(db);
+  cleanup(workdir);
+}
+
 /* --latency: the per-message shape, reported as a DISTRIBUTION.
 **
 ** Every other store row here is a rate, and a rate cannot answer the question
@@ -271,6 +347,25 @@ static void print_rewrites(const sqlite3_uint64 *a, double stored){
 ** the write path -- that difference is what a background repack would buy, and
 ** it is the number to have before adding a thread to a process that has none. */
 static int nLatency = 0;           /* --latency N: N single-record commits */
+/* --build-only / --catchup-only: the merge input has to be COLD.
+**
+** Library 2.9.0 added a posix_madvise(WILLNEED) per merge input, from our own
+** call graph showing 11.6% of a bulk load in page faults under XXH3_hashLong.
+** A hint can only help when the pages are NOT resident -- and every fixture in
+** this file writes its input and merges it moments later, which is the worst
+** possible case for observing one.  On the production box the whole 260MB
+** database also fits in ARC many times over, so "run it on ZFS" is not enough
+** either.  An A/B across those two libraries on the existing cascade phase
+** would measure nothing and would wrongly condemn the change.
+**
+** So the phases are split across processes, with an external cache drop in
+** between: --build-only leaves a database with the cascade disarmed and a pile
+** of unmerged files, and --catchup-only opens it and times the merge alone.
+** Fault counts are reported alongside the time, from getrusage, because the
+** hint acts on faults and a fault count is a much less noisy read on whether
+** it did anything than a wall clock on a shared machine. */
+static int buildOnly = 0;          /* --build-only: build and leave it */
+static int catchupOnly = 0;        /* --catchup-only: merge an existing one */
 static int sealEvery = 0;          /* --seal-every N: zs_db_seal from "idle"
                                    ** every N commits, untimed, to price the
                                    ** conversion outlier away */
@@ -618,6 +713,10 @@ int main(int argc, char **argv){
       zInit = argv[++i];
     }else if( !strcmp(argv[i], "--uri") && i+1<argc ){
       zUri = argv[++i];
+    }else if( !strcmp(argv[i], "--build-only") ){
+      buildOnly = 1;
+    }else if( !strcmp(argv[i], "--catchup-only") ){
+      catchupOnly = 1;
     }else if( !strcmp(argv[i], "--seal-every") && i+1<argc ){
       sealEvery = atoi(argv[++i]);
     }else if( !strcmp(argv[i], "--latency") && i+1<argc ){
@@ -646,7 +745,8 @@ int main(int argc, char **argv){
                       " [--reps N] [--init SQL] [--uri PARAMS] [--vacuum]"
                       " [--rowid] [--random] [--only N] [--defer-repack]"
                       " [--opens N] [--build-uri PARAMS] [--opens-per N]"
-                      " [--latency N] [--seal-every N]\n");
+                      " [--latency N] [--seal-every N]"
+                      " [--build-only] [--catchup-only]\n");
       return 2;
     }
   }
@@ -671,7 +771,11 @@ int main(int argc, char **argv){
   ** enough for the repack cascade to matter -- which is where the rewrite
   ** counters get interesting -- the 1-per-txn row alone is 2 million
   ** commits, so a full sweep is not the way to ask that question. */
-  if( nLatency>0 ){
+  if( buildOnly ){
+    bench_build_only();
+  }else if( catchupOnly ){
+    bench_catchup_only();
+  }else if( nLatency>0 ){
     bench_latency(nLatency);
   }else if( nOpens>0 ){
     bench_opens(nOpens);

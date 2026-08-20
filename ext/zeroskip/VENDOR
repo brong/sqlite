@@ -1,5 +1,30 @@
-source: a19ecce
-date: 2026-08-19 (library 2.9.0, and 2.8.0/2.7.0/2.6.0 with it.
+source: d732ee4
+date: 2026-08-19 (library 2.9.0, and 2.8.0/2.7.0/2.6.0 with it.  d732ee4 is
+      a19ecce plus a two-thread test and two header-comment fixes; the only
+      vendored change is zeroskip.h, all documentation.
+
+      ONE OF THOSE FIXES MATTERS TO US AND WE ARE CLEAN ON IT.  rollover_txns
+      used to say "A handle with index_dir set is already bounded by P-13 and
+      will not reach this", which stopped being true AT P-13 -- a commit no
+      longer publishes, so nothing resets the window any more.  A caller
+      picking a seal cadence would have read the opposite of the behaviour.
+      We never carried that claim: the 2.5.0 entry below records the corrected
+      version, and our cliff fixtures pin zs_rollover_txns explicitly rather
+      than relying on any exemption.
+
+      zs_db_seal's documentation now carries our 500-vs-4000 measurement and
+      the interaction we found (sealing frequently with the cascade ARMED takes
+      rewriting 3.2x -> 4.3x of stored), so the three-lever combination is
+      stated upstream rather than rediscovered per caller.
+
+      THE WILLNEED HINT IS STILL UNMEASURED, and cannot be measured on APFS or
+      by any existing fixture here, because they all write the merge input and
+      merge it moments later.  test/zs/prefetch-ab.sh is the measurement that
+      can see it: build with the cascade disarmed, drop the page cache, then
+      time and FAULT-COUNT the merge alone, both libraries interleaved with
+      alternating arm order.  Calibrated on APFS, where it correctly reports
+      no difference (identical minor-fault counts, zero major).  Upstream's
+      position is that if it does not show on ZFS it should come out.
 
       THE MERGE PATH HINTS THE KERNEL (2.9.0): one
       posix_madvise(POSIX_MADV_WILLNEED) per input in both merge paths, from
