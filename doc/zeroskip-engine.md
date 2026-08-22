@@ -1642,15 +1642,56 @@ Underneath us on upstream's own fixture, where the arms are quieter
 still, raw `store, 1000 per txn` goes 2406-2438k/s -> 2193-2201k/s
 (-9%) and `store, all in one txn` 4353-4451k -> 4200-4236k (-3..-5%).
 
-Upstream priced the CONVERSION half of this and declined to chase it --
-one 20MB conversion going 10.3ms -> 12.5ms, "about 2% of a bulk load
-that seals", against +19% on a scan, the cause being the builder's
-32-byte descriptor per record and its second pass where format 2
-encoded into one buffer in a single pass.  **Two things that figure
-misses at our scale, and they are what to send back:** the REPACK path
-pays the same builder cost (+21%, which upstream did not measure), and
-in a cascading bulk load repacks are ~3x the conversion bytes -- so the
-weighted cost is 150ms, not 2ms.
+Upstream measures this as -4.7% on a load that seals once, and puts it
+down to the builder's 32-byte descriptor per record and its second pass
+over them.  **Their fixture seals once and never repacks; ours cascades
+117 conversions and 39 repacks of 841MB**, which is why the same change
+reads as -4.7% there and -10..-13% here.
+
+##### What actually got slower, attributed
+
+A 12-second `sample` of the 2M load on each arm, comparing the writer
+branch under `zsi_repack_run` (samples, so +/- sqrt(n)):
+
+| | 2.9.1 | 3.0.0 |
+|---|---:|---:|
+| record/entry encode | `zsi_rec_encode` 80 | `zsi_inorder_add` 94 |
+| -- of which value copying | memmove 15 | memmove 49 + realloc 16 |
+| -- of which zeroing | memset 40 | (moved to `kent_encode`, 5) |
+| output checksum | one-shot XXH3 29 | streaming XXH3 55 |
+| layout pass | -- | `zsi_inorder_finish` encode 28 |
+| **writer total** | **109** | **186** |
+
+Two of those are worth reporting upstream, because neither is inherent
+to key/value separation:
+
+**1. The trailer checksum moved from XXH3's one-shot path to its
+streaming path, and that costs 2.4x on the same bytes.** Format 2's
+records region was one contiguous buffer, so it hashed with
+`XXH3_64bits` (`XXH3_hashLong_64b_internal`).  Format 3 keeps keys and
+values in *separate* buffers -- deliberately, so the values can be
+written straight from where they were accumulated -- so `zsi_csum2` has
+to stream them (`XXH3_64bits_update` -> `XXH3_consumeStripes`).
+Measured directly on this laptop over 21MB split 1:10, same digest both
+ways: **one-shot 51.2 GB/s, streamed-over-two-buffers 20.9 GB/s**.
+That is the cost of the very optimisation that avoided a copy: skipping
+one memcpy of the values (~0.04 s/GB) bought a hash that costs ~0.028
+s/GB more.  Close to a wash by that arithmetic, and the profile says it
+did not come out ahead.
+
+**2. `zsi_inorder_add` grows both its buffers by doubling, and 16 of its
+94 samples are the resulting reallocs** -- `_platform_memmove` and
+`mach_vm_copy` re-copying the accumulated values buffer, repeatedly, on
+the way up.  This one is free to fix: a repack cannot know its exact
+output size (D-18/D-19 drop keys), but it has a cheap upper bound in the
+sum of its inputs' `values_len` and pointer counts, both of which format
+3 now carries in the header.  The buffer is transient and freed at
+`fini`, so over-reserving costs nothing.
+
+Neither is the 32-byte descriptor upstream named.  The descriptor array
+does show up -- ~29 of `zsi_inorder_add`'s samples are neither the value
+copy nor the realloc -- but it is the smaller half of the story, and the
+two items above are the ones with an obvious fix.
 
 Write amplification otherwise improves.  At 200k: WITHOUT ROWID 6.7x ->
 5.6x of stored at 100-per-txn and 6.9x -> 5.8x at 1000; rowid 1000/txn
