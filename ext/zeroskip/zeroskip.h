@@ -212,6 +212,24 @@ struct zs_open_data {
      * end it can afford. */
     size_t       repack_max_size;
 
+    /* A-20/D-20c: how much of an in-order output (a conversion's or a merge's)
+     * this handle may hold in memory.  A region larger than this is streamed out
+     * of the inputs' mappings as it is produced; a smaller one is held, which
+     * lets it be checksummed in one call and written in one write.  0 = default
+     * 64MB.
+     *
+     * It exists because holding the output is O(output), which for
+     * zs_db_compact is O(database): without a ceiling a caller cannot compact a
+     * database larger than memory, and nothing in the API says why.  Both shapes
+     * produce the same bytes, so this changes nothing another implementation can
+     * observe -- and a merge's memory is O(records) regardless, since the keys
+     * and values stay in the inputs' mappings until they are copied out.
+     *
+     * Lowering it bounds memory and costs the one-shot checksum on outputs that
+     * would have fitted (about 6% of a bulk load's time when everything streams);
+     * raising it does the reverse. */
+    size_t       merge_memory;
+
     void       (*error)(const char *msg, const char *fmt, ...);
 
     /* Pointer table cache (spec section 8).  Names the cache ROOT: tables for
@@ -229,7 +247,8 @@ struct zs_open_data {
     size_t       index_threshold;  /* A-9: 0 = the default, 32KB */
 };
 
-#define ZS_OPEN_DATA_INITIALIZER { 0, NULL, NULL, NULL, 0, 0, 0, NULL, NULL, 0 }
+#define ZS_OPEN_DATA_INITIALIZER \
+    { 0, NULL, NULL, NULL, 0, 0, 0, 0, NULL, NULL, 0 }
 
 /* What this handle has REWRITTEN, since it was opened (A-17).
  *

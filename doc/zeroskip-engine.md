@@ -1648,7 +1648,73 @@ over them.  **Their fixture seals once and never repacks; ours cascades
 117 conversions and 39 repacks of 841MB**, which is why the same change
 reads as -4.7% there and -10..-13% here.
 
-##### What actually got slower, attributed
+##### Fixed upstream in 3.0.1/3.1.0, and what it cost to fix
+
+Both items below went upstream and both were taken.  3.0.1 abuts the
+body in one buffer -- values accumulated behind a gap, the head written
+so it ends exactly where they begin -- so the checksum is one one-shot
+call and the body one `write(2)`; and both writers reserve from their
+inputs, so no value byte is copied by a growing buffer.  Upstream
+reproduces the streaming measurement independently (21 GB/s against 54,
+flat across chunk sizes) and adds a trap worth knowing: **the
+reservation has to be ONE allocation rather than growth into one**, or
+the kernel faults in every page of a gap nothing has touched.
+
+3.1.0 then makes a merge hold a 32-byte *reference* per record into the
+inputs' mappings rather than the output bytes, so its memory is
+O(records) not O(output).  That one matters to us specifically: we call
+`zs_db_compact` from `VACUUM` and from a backup's finish, and a
+compaction's output is O(database) -- before this, a `VACUUM` on a
+database larger than memory could not work.
+
+Ten passes per arm, 2M records at 1000-per-txn, rowid, order rotated:
+
+| | 2.9.1 (fmt2) | 3.0.0 | 3.1.0 | vs 3.0.0 |
+|---|---:|---:|---:|---:|
+| store/s | 1695-1760k | 1548-1597k | 1642-1699k | +3..10% |
+| convert ms | 123-127 | 137-141 | 131-138 | overlap |
+| repack ms | 396-430 | 494-531 | 432-465 | -6..-19% |
+| merge total | 520-556 | 632-671 | 563-597 | -6..-16% |
+| **peak RSS** | 484MB | 629MB | **318MB** | **-49..-50%** |
+| merge MB | 1093 | 1106 | 1106 | unchanged |
+
+The store row is back to **overlapping format 2**.  Be precise about
+what is not: merge total is still +1..15% above format 2, so the
+counters see a residual the store row no longer can.  Upstream's sealing
+fixture is fully back at format 2; a cascading load is not -- the same
+asymmetry as before, since theirs seals once and ours runs 39 repacks
+over 841MB.
+
+##### zs_merge_memory, and why we keep the default
+
+`merge_memory` (A-20, default 64MB) decides per region: one that fits is
+held and checksummed in one call, a larger one streams through a 256KB
+window.  Exposed as the URI parameter `zs_merge_memory=BYTES`.  Swept at
+2M, five passes per setting, order rotated -- **the bytes written are
+identical across all three**, which is both the correctness check and
+the proof the knob changes only memory:
+
+| `zs_merge_memory` | store/s | merge ms | peak RSS |
+|---|---:|---:|---:|
+| 1 byte (all streamed) | 1644-1670k | 591-627 | 315MB |
+| 64MB (default) | 1461-1708k | 561-629 | 318MB |
+| 1GB (all held) | 1717-1780k | 529-556 | 619MB |
+
+At 1GB the merge total lands *inside* format 2's 520-556 range and the
+store row at or above it, so the last of the format-3 merge cost is the
+streaming checksum on the few merges too big for the ceiling.  The
+default buys almost nothing over full streaming at our shape (561-629
+against 591-627, overlapping), because our merge *bytes* are
+concentrated in the few big cascade merges that exceed 64MB even though
+most merges by *count* fit under it.
+
+**We keep the default**: 318MB against 619MB is worth ~7% of merge time
+for a mail store, and the knob is documented for a bulk-import window
+where the memory is there and the cascade is the cost.  Re-take that
+decision on production, where the merge is slower in absolute terms and
+there is 993GB of RAM -- `prodrun` should sweep it.
+
+##### What actually got slower, attributed (3.0.0, kept as the record)
 
 A 12-second `sample` of the 2M load on each arm, comparing the writer
 branch under `zsi_repack_run` (samples, so +/- sqrt(n)):

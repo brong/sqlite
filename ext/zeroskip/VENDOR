@@ -1,6 +1,91 @@
-source: 52a1e84
-date: 2026-08-21 (library 3.0.0 -- FORMAT 3, and 2.9.1/2.9.0/2.8.0/2.7.0/2.6.0
-      below it.
+source: fac755a
+date: 2026-08-22 (library 3.1.0, and 3.0.1 with it -- our two findings from
+      yesterday, confirmed and fixed upstream, plus a memory bound we did not
+      ask for and want more than either.  No format change; 3.0.0 files are
+      read unchanged, and "no file byte changes" is upstream's own assertion
+      pinned by test_corpus_encode_byte_identical.
+
+      BOTH FINDINGS CONFIRMED, WITH THE SAME NUMBERS.  Upstream measures XXH3's
+      streaming state at 21 GB/s against 54 one-shot (we measured 21 against
+      51, test/zs/xxhcmp.c) and reproduces the part that mattered: FLAT across
+      1, 2, 64KB-chunked and 1MB-chunked update calls, so the penalty is the
+      API and neither chunking nor re-ordering recovers any of it.  3.0.1 takes
+      the abutted-buffer shape -- values accumulated behind a GAP, the head
+      written so it ends exactly where they begin -- so the body is one
+      contiguous run: one one-shot checksum, one write(2).  Both writers now
+      RESERVE from their inputs, so no value byte is copied by a growing
+      buffer, which was our second item.  They also found the reservation must
+      be ONE allocation rather than growth into one, or the kernel faults in
+      every page of a gap nothing has touched -- worth ~10ms of 111
+      conversions, and a trap we would not have predicted.
+
+      3.1.0 THEN GOES FURTHER, AND THIS IS THE PART THAT MATTERS MOST TO US.  A
+      merge now holds a 32-byte reference per record into the inputs' mappings
+      instead of the output bytes, so its memory is O(records) not O(output).
+      We call zs_db_compact from VACUUM and from a backup's finish, and a
+      compaction's output is O(DATABASE) -- so before this, VACUUM on a
+      database larger than memory could not work and nothing in the API said
+      why.  Measured here at 2M records, ten passes per arm with the order
+      rotated: peak RSS 629MB (3.0.0) -> 318MB, which is also 34% BELOW format
+      2's 484MB.  Dead stable, +/-0 across every pass.
+
+      THE STORE REGRESSION IS CLOSED, THE MERGE IS ALMOST BACK.  Same ten-pass
+      run, 2M records at 1000-per-txn, rowid:
+
+                        2.9.1 (fmt2)    3.0.0        3.1.0     vs 3.0.0
+          store/s      1695-1760k   1548-1597k   1642-1699k    +3..10%
+          convert ms      123-127      137-141      131-138    overlap
+          repack ms       396-430      494-531      432-465   -6..-19%
+          merge total     520-556      632-671      563-597   -6..-16%
+          peak RSS         484MB        629MB        318MB   -49..-50%
+          merge MB          1093         1106         1106    unchanged
+
+      The store row is back to OVERLAPPING format 2, which is the claim that
+      matters.  But be precise about what is not: merge total is still +1..15%
+      above format 2, so the counters say the recovery is not total even though
+      the store row can no longer see the difference.  Upstream reports their
+      sealing fixture fully back at format 2; a cascading load is not, and that
+      is the same asymmetry as before -- their fixture seals once, ours runs 39
+      repacks over 841MB.
+
+      THE RESIDUAL IS RECOVERABLE, AND IT COSTS EXACTLY THE MEMORY BACK.
+      merge_memory (A-20, default 64MB) decides per region: one that fits is
+      HELD and checksummed in one call, a larger one STREAMS through a 256KB
+      window.  Now reachable as the URI parameter zs_merge_memory=BYTES.  Swept
+      at 2M, five passes per setting, order rotated -- and the bytes written are
+      identical across all three, which is both the correctness check and the
+      proof the knob changes only memory:
+
+          mm=1B (all streamed)   store 1644-1670k  merge 591-627ms  RSS 315MB
+          mm=64MB (default)      store 1461-1708k  merge 561-629ms  RSS 318MB
+          mm=1GB (all held)      store 1717-1780k  merge 529-556ms  RSS 619MB
+
+      At 1GB the merge total lands INSIDE format 2's 520-556 range and the
+      store row at or above it -- so the last of the format-3 merge cost is
+      the streaming checksum on the few merges too big for the ceiling.  The
+      default buys almost nothing over full streaming at our shape (561-629
+      against 591-627, overlapping) because our merge BYTES are concentrated
+      in the few big cascade merges that exceed 64MB, even though most merges
+      by COUNT fit under it.
+
+      WE KEEP THE DEFAULT.  318MB against 619MB is worth ~7% of merge time for
+      a mail store, and the knob is documented for a bulk-import window where
+      the memory is available and the cascade is the cost.  That is a decision
+      to re-take on production, where the merge is slower in absolute terms and
+      the memory is 993GB -- prodrun should sweep it.
+
+      A note on upstream's own tests worth carrying: five mutants had ROTTED at
+      52a1e84 -- the version we vendored yesterday -- because a rename left them
+      testing nothing while still reading as line items in the report.  Repaired
+      in 3.0.1.  A passing mutant list is not evidence unless something checks
+      the mutants still bite.
+
+      Test tier, all green on 3.1.0: zskey-test, zsbtree-test, the 10 SQL
+      batteries, format-guard (8 cases, including the format-2 fixture),
+      crash-test 10 rounds, busy-test, backup-concurrent, 966/966 through the
+      TCL permutation, twowriter 6/6 and metacache 8/8.
+
+      Below: 3.0.0 -- FORMAT 3, and 2.9.1/2.9.0/2.8.0/2.7.0/2.6.0 under it.
 
       A FORMAT CHANGE IS A RE-VENDOR AND A RE-VERIFY, NOT A PORT -- and that
       claim, which this engine's doc has made since the first vendoring, has
@@ -404,3 +489,6 @@ repack: ZS_NOAUTOREPACK is reachable as the URI parameter zs_norepack=1,
       with sqlite3ZsRepackCatchUp() to finish the job from idle time.
       zs_rollover=BYTES sets the generation size; rollover_txns is left at
       the library default deliberately (see zsbtEnsureOpen).
+merge-memory: zs_merge_memory=BYTES reaches A-20's ceiling (default 64MB).
+      Added 3.1.0.  Left at the default; see the sweep in the entry above and
+      in doc/zeroskip-engine.md for what raising it buys and costs.

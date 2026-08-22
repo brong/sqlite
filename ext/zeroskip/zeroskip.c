@@ -116,6 +116,21 @@ void (*zs_hook_snapshot_gap)(const char *dir) = NULL;
  * files just looks slow. */
 #define ZSI_DEFAULT_REPACK_MAX (512 * 1024 * 1024)
 
+/* How much of an in-order output a writer may HOLD (A-20).  A region larger than
+ * this is streamed out of the inputs' mappings as it is produced, so a merge's
+ * memory does not grow with the database; a smaller one is held, because holding
+ * it lets the region be checksummed in one call -- about 54 GB/s against 21 GB/s
+ * streamed -- and written in one write.
+ *
+ * 64MB rather than something larger because the point is the ceiling: the
+ * buffered shape is O(output), which for a compaction (D-26) is O(database), and
+ * a caller compacting a database bigger than its memory had no way to see why it
+ * failed.  Rather than something smaller because every merge an ordinary database
+ * performs is well under it, and those keep the one-shot checksum.  Measured on a
+ * 2M-record load: 341MB peak RSS streaming everything against 684MB holding
+ * everything, for about 6% of the load's time. */
+#define ZSI_DEFAULT_MERGE_MEMORY (64 * 1024 * 1024)
+
 /* How many files the cap above may skip before it yields for one selection.
  *
  * The cap costs the file-count bound the geometric policy exists to provide: a
@@ -431,6 +446,35 @@ static uint64_t zsi_since_ns(uint64_t t0)
 {
     uint64_t now = zsi_now_ns();
     return (t0 && now > t0) ? now - t0 : 0;
+}
+
+/* Append bytes to a file descriptor, retrying a short write.  Here rather than
+ * in the write path because the in-order writers emit through it too, and a
+ * section may only call upwards. */
+static int zsi_write_all(int fd, const char *buf, size_t len)
+{
+    size_t off = 0;
+
+    while (off < len) {
+        ssize_t n = ZS_WRITE(fd, buf + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return ZS_IOERROR;
+        }
+        if (n == 0) return ZS_IOERROR;
+        off += (size_t)n;
+    }
+
+    return ZS_OK;
+}
+
+/* The same at a given offset.  lseek + ZS_WRITE rather than pwrite, so the
+ * writes stay visible to the hook T-8's crash injection interposes -- a writer
+ * that went around it would quietly stop being crash-tested. */
+static int zsi_write_at(int fd, const char *buf, size_t len, off_t off)
+{
+    if (lseek(fd, off, SEEK_SET) == (off_t)-1) return ZS_IOERROR;
+    return zsi_write_all(fd, buf, len);
 }
 
 /********** COMPARATORS *************/
@@ -2464,7 +2508,7 @@ static int zsi_ptrs_search(struct zsi_file *f, zs_compar *compar,
     return ZS_OK;
 }
 
-/* Accumulate an in-order file's body, then lay it out.
+/* Lay out an in-order file's body, holding a REFERENCE per record and no bytes.
  *
  * Both writers -- conversion and repack -- feed records in key order and this
  * builds [pointer region][keys][values][trailer].  It exists once so D-17 to
@@ -2473,52 +2517,111 @@ static int zsi_ptrs_search(struct zsi_file *f, zs_compar *compar,
  *
  * D-20c requires every section's length to be known before the first byte is
  * written, because the header carries them and the pointer region precedes the
- * data.  This satisfies that by BUFFERING the body, which is what format 2's
- * writers already did -- they held the whole records region in memory too.  The
- * spec's cheaper shape (walk the inputs' keys twice, stream the values once) is
- * available later and needs no format change; nothing here depends on the choice.
- *
- * Two things are relative until the end, and must be, because both absolute
- * values depend on the pointer region's size, which depends on a record count
- * that is not known until the last record has been offered:
+ * data.  Two things are therefore relative until the end, both depending on the
+ * pointer region's size and so on a record count not known until the last record
+ * has been offered:
  *
  *   - an entry's valptr is an offset into the values region;
  *   - an entry's own offset is an offset into the keys region.
+ *
+ * MEMORY IS O(RECORDS), NOT O(BYTES), and that is the shape of the whole file.
+ * Every input is already mapped -- a repack's by the snapshot, a conversion's by
+ * the writer -- so a record's key and value bytes are addressable where they
+ * were written, and a 32-byte descriptor pointing at them is enough.  Nothing is
+ * copied until the emit, which walks the descriptors and copies each region
+ * straight from the inputs' mappings.  The DESTINATION offsets are not stored:
+ * the emit walks in the same order the records arrived, so an entry's offset in
+ * the keys region and its value's offset in the values region are running sums,
+ * exact and free.
+ *
+ * The buffered shape this replaces was O(output), which for a compaction (D-26)
+ * is O(database) -- so a caller could not compact a database larger than memory,
+ * and nothing in the API said why.  Measured on the largest merge of a
+ * 2M-record load, 1.728M records and a 212.5MB body: 55MB against 277MB.
+ *
+ * What it costs is the ONE-SHOT checksum.  F-33 covers the keys and values
+ * regions as one run and they are no longer one run in memory, so the digest is
+ * accumulated as the bytes pass by -- XXH3 streams at about 21 GB/s here against
+ * 54 GB/s one-shot, which is ~6ms per 200MB of output.  A caller-supplied engine
+ * (F-5d) cannot stream at all, so for ZS_CSUM_EXTERNAL the region IS held and
+ * checksummed in one call; that is the same code path as emitting into memory
+ * for a test (fd < 0), which is what keeps it from becoming a second
+ * implementation of the layout.
  */
 struct zsi_inorder_ent {
     const char *key;
-    size_t      keylen;
-    uint64_t    vrel;            /* offset within the values region */
-    bool        isdelete;
+    const char *val;             /* NULL is a deletion: no value bytes (F-37) */
+    size_t      keylen, vallen;
 };
 
 struct zsi_inorder_out {
     struct zsi_inorder_ent *ents;
     size_t                  nents, ents_alloc;
-    char                   *vals;
-    size_t                  vlen, vals_alloc;
+    size_t                  vlen;        /* the values region's length so far */
+    /* The keys region's length in each width, maintained per record so the fixed
+     * point below is O(1) an iteration rather than a pass over every descriptor.
+     * The sentinel is in neither sum: it is added at layout time, where the
+     * width is settled. */
+    size_t                  klen_narrow, klen_wide;
     bool                    failed;
 };
 
 static void zsi_inorder_out_fini(struct zsi_inorder_out *w)
 {
     free(w->ents);
-    free(w->vals);
     memset(w, 0, sizeof(*w));
 }
 
-/* Offer one record.  key must stay valid until zsi_inorder_finish -- every
- * caller holds its sources mapped for longer than that.  val == NULL is a
- * deletion, which contributes nothing at all to the values region (F-37). */
+/* Size the descriptor array once, from a bound on the record count: a conversion
+ * knows it exactly, a repack sums its inputs' pointer counts.  A HINT -- the
+ * array still doubles if the bound was short, it just copies tens of megabytes
+ * of descriptors on the way. */
+static void zsi_inorder_reserve(struct zsi_inorder_out *w, size_t nents)
+{
+    struct zsi_inorder_ent *q;
+
+    if (w->ents || !nents) return;
+    if (nents > SIZE_MAX / sizeof(*q)) return;
+
+    q = malloc(nents * sizeof(*q));
+    if (!q) return;
+    w->ents = q;
+    w->ents_alloc = nents;
+}
+
+/* Offer one record.  key and val MUST stay valid until the emit -- every caller
+ * holds its sources mapped for longer than that, which is the premise the
+ * builder rests on.  val == NULL is a deletion, which contributes nothing at all
+ * to the values region (F-37). */
 static int zsi_inorder_add(struct zsi_inorder_out *w, const char *key,
                            size_t keylen, const char *val, size_t vallen)
 {
+    size_t nn, nw, klen_narrow, klen_wide, vlen;
+
     if (w->failed) return ZS_INTERNAL;
     if (keylen < 1) return ZS_BADFORMAT;            /* F-14 */
 
+    nn = zsi_kent_encoded_len(keylen, false);
+    nw = zsi_kent_encoded_len(keylen, true);
+    if (!nn || !nw) { w->failed = true; return ZS_BADFORMAT; }
+    if (!zsi_add_sz(w->klen_narrow, nn, &klen_narrow)
+        || !zsi_add_sz(w->klen_wide, nw, &klen_wide)) {
+        w->failed = true;
+        return ZS_BADFORMAT;
+    }
+
+    /* the value plus the trailing NUL F-37 requires */
+    vlen = w->vlen;
+    if (val && !zsi_add3_sz(w->vlen, vallen, 1, &vlen)) {
+        w->failed = true;
+        return ZS_BADFORMAT;
+    }
+
     if (w->nents == w->ents_alloc) {
         size_t want = w->ents_alloc ? w->ents_alloc * 2 : 256;
-        struct zsi_inorder_ent *q = realloc(w->ents, want * sizeof(*q));
+        struct zsi_inorder_ent *q;
+        if (want > SIZE_MAX / sizeof(*q)) { w->failed = true; return ZS_INTERNAL; }
+        q = realloc(w->ents, want * sizeof(*q));
         if (!q) { w->failed = true; return ZS_INTERNAL; }
         w->ents = q;
         w->ents_alloc = want;
@@ -2527,70 +2630,45 @@ static int zsi_inorder_add(struct zsi_inorder_out *w, const char *key,
     struct zsi_inorder_ent *e = &w->ents[w->nents];
     e->key = key;
     e->keylen = keylen;
-    e->isdelete = (val == NULL);
-    e->vrel = (uint64_t)w->vlen;
+    e->val = val;
+    e->vallen = val ? vallen : 0;
 
-    if (val) {
-        size_t need;
-        /* the value plus the trailing NUL F-37 requires */
-        if (!zsi_add3_sz(w->vlen, vallen, 1, &need)) {
-            w->failed = true;
-            return ZS_BADFORMAT;
-        }
-        if (need > w->vals_alloc) {
-            size_t want = w->vals_alloc ? w->vals_alloc * 2 : 8192;
-            while (want < need) {
-                if (want > SIZE_MAX / 2) { w->failed = true; return ZS_INTERNAL; }
-                want *= 2;
-            }
-            char *q = realloc(w->vals, want);
-            if (!q) { w->failed = true; return ZS_INTERNAL; }
-            w->vals = q;
-            w->vals_alloc = want;
-        }
-        if (vallen) memcpy(w->vals + w->vlen, val, vallen);
-        w->vals[w->vlen + vallen] = '\0';
-        w->vlen = need;
-    }
-
+    w->klen_narrow = klen_narrow;
+    w->klen_wide = klen_wide;
+    w->vlen = vlen;
     w->nents++;
     return ZS_OK;
 }
 
-/* Lay out the body.  Returns a malloc'd buffer holding
- * [pointer region][keys][values][trailer], and reports the two lengths the
- * header must carry (F-10a).
+/* Every length and offset the header and the emit need.
  *
  * WIDTHS ARE A FIXED POINT, not a calculation, because each depends on offsets
  * the other moves: the pointer width on where the keys region ends, the valptr
- * width on where the values region ends, and widening either pushes both
- * further out.  Widening only ever increases an offset, so the iteration is
- * monotone -- it settles in at most two rounds and the answer it settles on is
- * canonical (F-26c): if narrow did not fit before widening, it does not fit
- * after. */
-static int zsi_inorder_finish(struct zsi_inorder_out *w, zs_csum *csum,
-                              unsigned csum_id, char **out, size_t *outlen,
-                              const char **vals_out, size_t *vals_len_out,
-                              char *trailer,
-                              uint64_t *keys_len_out, uint64_t *values_len_out,
-                              bool *val_wide_out)
+ * width on where the values region ends, and widening either pushes both further
+ * out.  Widening only ever increases an offset, so the iteration is monotone --
+ * it settles in at most two rounds and the answer it settles on is canonical
+ * (F-26c): if narrow did not fit before widening, it does not fit after. */
+struct zsi_layout {
+    bool   ptr_wide, val_wide;
+    size_t seclen;                       /* the pointer region, pad included */
+    size_t keys_len, values_len;
+    size_t keys_off, values_off, values_end;         /* offsets in the file */
+};
+
+static int zsi_inorder_layout(const struct zsi_inorder_out *w,
+                              struct zsi_layout *lay)
 {
     bool ptr_wide = false, val_wide = false;
-    size_t seclen = 0, keys_len = 0, keys_off = 0, values_off = 0;
-    size_t values_end = 0, i;
 
     if (w->failed) return ZS_INTERNAL;
 
     for (;;) {
         bool need_pw, need_vw;
+        size_t keys_len, seclen, keys_off, values_off, values_end;
 
-        keys_len = 0;
-        for (i = 0; i < w->nents; i++) {
-            size_t n = zsi_kent_encoded_len(w->ents[i].keylen, val_wide);
-            if (!n) return ZS_BADFORMAT;
-            if (!zsi_add_sz(keys_len, n, &keys_len)) return ZS_BADFORMAT;
-        }
-        /* the sentinel: keylen 0, one past the values region (F-36a) */
+        /* the entries, then the sentinel: keylen 0, one past the values region
+         * (F-36a) */
+        keys_len = val_wide ? w->klen_wide : w->klen_narrow;
         if (!zsi_add_sz(keys_len, zsi_kent_encoded_len(0, val_wide), &keys_len))
             return ZS_BADFORMAT;
 
@@ -2603,74 +2681,332 @@ static int zsi_inorder_finish(struct zsi_inorder_out *w, zs_csum *csum,
 
         need_pw = ptr_wide || values_off > 0xFFFFFFFFu;   /* keys region end */
         need_vw = val_wide || values_end > 0xFFFFFFFFu;
-        if (need_pw == ptr_wide && need_vw == val_wide) break;
+        if (need_pw == ptr_wide && need_vw == val_wide) {
+            lay->ptr_wide   = ptr_wide;
+            lay->val_wide   = val_wide;
+            lay->seclen     = seclen;
+            lay->keys_len   = keys_len;
+            lay->values_len = w->vlen;
+            lay->keys_off   = keys_off;
+            lay->values_off = values_off;
+            lay->values_end = values_end;
+            return ZS_OK;
+        }
         ptr_wide = need_pw;
         val_wide = need_vw;
     }
+}
 
-    /* The HEAD only: pointers and keys.  The values are written straight from
-     * the buffer they were accumulated in, which is why this is not one
-     * allocation -- copying them into a combined buffer would be a second pass
-     * over every value byte in the file, and it measured 6% of a bulk load that
-     * seals (200k records in one transaction: 4.61 M/s against 4.33). */
-    size_t total = values_off - ZSI_HEADER_LEN;
+/* A sequential writer over one region of the output, checksumming what passes
+ * through it.
+ *
+ * Two shapes, and the only difference is the capacity.  A STREAMING sink holds a
+ * fixed window, hashes each chunk as it fills and writes it at the offset it has
+ * reached, so its memory does not depend on the region's size; a JOINED sink has
+ * room for the whole region and flushes once, which is what an engine that can
+ * only checksum a single run needs (F-5d) and what a caller wanting the bytes
+ * rather than a file gets.  Both are filled by exactly the same emit.
+ *
+ * Writes go through lseek + ZS_WRITE rather than pwrite deliberately: ZS_WRITE
+ * is the hook T-8's crash injection interposes, and a merge that wrote around it
+ * would quietly stop being crash-tested. */
+#define ZSI_SINK_WINDOW  (256u * 1024u)
 
-    char *buf = zsi_zmalloc(total ? total : 1);  /* zeroed: F-26d's pad, F-2 */
-    if (!buf) return ZS_INTERNAL;
+struct zsi_sink {
+    int           fd;                    /* < 0: keep the bytes, never write */
+    off_t         at;                    /* file offset of the next flush */
+    char         *buf;
+    size_t        len, cap;
+    bool          owned;
+    bool          stream;                /* flush as it fills, hashing as it goes */
+    unsigned      csum_id;
+    zs_csum      *csum;
+    XXH3_state_t  st;                    /* engine 1 */
+    uint64_t      digest;                /* engine 2, from its single flush */
+    unsigned      flushes;
+    int           err;
+};
 
-    char  *ptrs = buf;
-    char  *keys = buf + (keys_off - ZSI_HEADER_LEN);
-    size_t phdr = ptr_wide ? 16 : 8;
-    size_t pper = ptr_wide ? 8 : 4;
-    size_t koff = 0;
+/* base != NULL borrows that buffer, which must have room for the whole region.
+ * fd < 0 requires it: there is nowhere to flush to. */
+static int zsi_sink_init(struct zsi_sink *s, int fd, off_t at, size_t region,
+                         size_t budget, char *base, zs_csum *csum,
+                         unsigned csum_id)
+{
+    memset(s, 0, sizeof(*s));
+    s->fd = fd;
+    s->at = at;
+    s->csum = csum;
+    s->csum_id = csum_id;
+    s->err = ZS_OK;
 
-    if (ptr_wide) {
-        ptrs[0] = (char)ZSI_PTRS64;
-        zsi_put64(ptrs + 8, (uint64_t)w->nents);
+    /* Stream a region that would cost more than the budget to hold (A-20), and
+     * hold one that would not, because holding it buys the one-shot checksum.
+     * A caller-supplied engine checksums one run in one call (F-5d), so it can
+     * never stream: its region is held whatever the budget says. */
+    s->stream = (fd >= 0 && csum_id != ZSI_CSUM_EXTERNAL && region > budget);
+
+    if (base) {
+        s->buf = base;
+        s->cap = region ? region : 1;
     } else {
-        ptrs[0] = (char)ZSI_PTRS32;
-        zsi_put32(ptrs + 4, (uint32_t)w->nents);
+        s->cap = s->stream ? ZSI_SINK_WINDOW : (region ? region : 1);
+        s->buf = malloc(s->cap);
+        if (!s->buf) return ZS_INTERNAL;
+        s->owned = true;
     }
 
-    for (i = 0; i < w->nents; i++) {
-        const struct zsi_inorder_ent *e = &w->ents[i];
-        uint64_t abs = (uint64_t)(keys_off + koff);
-
-        if (ptr_wide) zsi_put64(ptrs + phdr + i * pper, abs);
-        else          zsi_put32(ptrs + phdr + i * pper, (uint32_t)abs);
-
-        zsi_kent_encode(keys + koff, e->key, e->keylen, e->isdelete,
-                        (uint64_t)values_off + e->vrel, val_wide);
-        koff += zsi_kent_encoded_len(e->keylen, val_wide);
-    }
-
-    /* The sentinel's offset and entry.  Its valptr is one past the values
-     * region, which is what makes F-36 unconditional for the last record. */
-    {
-        uint64_t abs = (uint64_t)(keys_off + koff);
-        if (ptr_wide) zsi_put64(ptrs + phdr + w->nents * pper, abs);
-        else          zsi_put32(ptrs + phdr + w->nents * pper, (uint32_t)abs);
-        zsi_kent_encode(keys + koff, NULL, 0, false, (uint64_t)values_end,
-                        val_wide);
-    }
-
-    /* Trailer: the data checksum over the keys and values regions as ONE run
-     * (F-33), then the pointer region's (F-34).  The two regions are contiguous
-     * in the file but live in separate buffers here, which is exactly what
-     * zsi_csum2 is for -- the same reason a span and its terminator use it.
-     * Neither checksum covers the other. */
-    zsi_put64(trailer, zsi_csum2(csum, csum_id, keys, keys_len,
-                                 w->vals ? w->vals : "", w->vlen));
-    zsi_put64(trailer + 8, csum(ptrs, seclen));
-
-    *out = buf;
-    *outlen = total;
-    *vals_out = w->vals;
-    *vals_len_out = w->vlen;
-    *keys_len_out = (uint64_t)keys_len;
-    *values_len_out = (uint64_t)w->vlen;
-    *val_wide_out = val_wide;
+    if (csum_id == ZSI_CSUM_XXHASH) XXH3_64bits_reset(&s->st);
     return ZS_OK;
+}
+
+static void zsi_sink_fini(struct zsi_sink *s)
+{
+    if (s->owned) free(s->buf);
+    s->buf = NULL;
+}
+
+/* Hash what is buffered and write it out.  A sink with no file keeps everything:
+ * its buffer IS the region, and it is the caller's answer. */
+static void zsi_sink_flush(struct zsi_sink *s)
+{
+    if (s->err != ZS_OK) return;
+
+    if (!s->stream) {
+        /* The whole region, checksummed in ONE call -- which is the only reason
+         * a small output is worth holding: XXH3 one-shots at about 54 GB/s
+         * against 21 GB/s streamed.  A second flush would checksum a fragment,
+         * and the capacity is the whole region precisely so there is never one.
+         * F-26g's value for an empty region comes from the engine either way,
+         * which is why this does not skip a zero length. */
+        if (s->flushes) { s->err = ZS_INTERNAL; return; }
+        s->digest = s->csum(s->buf, s->len);
+        s->flushes++;
+        if (s->fd >= 0 && s->len)
+            s->err = zsi_write_at(s->fd, s->buf, s->len, s->at);
+        return;
+    }
+
+    if (!s->len) return;
+    if (s->csum_id == ZSI_CSUM_XXHASH)
+        XXH3_64bits_update(&s->st, s->buf, s->len);
+    s->flushes++;
+    s->err = zsi_write_at(s->fd, s->buf, s->len, s->at);
+    s->at += (off_t)s->len;
+    s->len = 0;
+}
+
+/* Bytes straight from an input's mapping: hashed and written without being
+ * copied, so a value larger than the window neither grows it nor is copied
+ * twice.  Only a streaming sink can do this -- a joined one owes its caller the
+ * bytes themselves. */
+static void zsi_sink_through(struct zsi_sink *s, const char *p, size_t n)
+{
+    zsi_sink_flush(s);
+    if (s->err != ZS_OK) return;
+
+    if (s->csum_id == ZSI_CSUM_XXHASH) XXH3_64bits_update(&s->st, p, n);
+    s->err = zsi_write_at(s->fd, p, n, s->at);
+    s->at += (off_t)n;
+}
+
+static char *zsi_sink_claim_slow(struct zsi_sink *s, size_t n)
+{
+    char *at;
+
+    if (s->err != ZS_OK) return NULL;
+
+    zsi_sink_flush(s);
+    if (s->err != ZS_OK) return NULL;
+
+    if (n > s->cap - s->len) {
+        /* One entry must be contiguous, so a key bigger than the window widens
+         * it -- bounded by that key, and nothing else can cause it. */
+        char *q;
+        if (!s->owned) { s->err = ZS_INTERNAL; return NULL; }
+        q = realloc(s->buf, n);
+        if (!q) { s->err = ZS_INTERNAL; return NULL; }
+        s->buf = q;
+        s->cap = n;
+    }
+
+    at = s->buf + s->len;
+    s->len += n;
+    return at;
+}
+
+/* n contiguous bytes for the caller to fill.
+ *
+ * `inline` is a MEASUREMENT: everything the emit does per record comes through
+ * here -- a pointer offset, a key entry, a value and its NUL -- so at millions of
+ * records the call frame is the cost, not the copy.  Clang inlines it either way;
+ * GCC's auto-inline budget does not, and zeroskip.c is compiled with the host
+ * project's flags, so it has to be said in the source (see zsi_cur_order). */
+static inline char *zsi_sink_claim(struct zsi_sink *s, size_t n)
+{
+    if (s->err == ZS_OK && n <= s->cap - s->len) {
+        char *at = s->buf + s->len;
+        s->len += n;
+        return at;
+    }
+    return zsi_sink_claim_slow(s, n);
+}
+
+static void zsi_sink_put(struct zsi_sink *s, const char *p, size_t n)
+{
+    char *at;
+
+    if (s->stream && n > s->cap) { zsi_sink_through(s, p, n); return; }
+
+    at = zsi_sink_claim(s, n);
+    if (at) memcpy(at, p, n);
+}
+
+/* One record's value: its bytes and the trailing NUL F-13 keeps, in ONE claim
+ * rather than two calls, because this runs per record. */
+static void zsi_sink_value(struct zsi_sink *s, const char *p, size_t n)
+{
+    char *at;
+
+    if (s->stream && n + 1 > s->cap) {
+        zsi_sink_through(s, p, n);               /* straight from the mapping */
+        at = zsi_sink_claim(s, 1);
+        if (at) *at = '\0';
+        return;
+    }
+
+    at = zsi_sink_claim(s, n + 1);
+    if (!at) return;
+    if (n) memcpy(at, p, n);
+    at[n] = '\0';
+}
+
+/* F-26d's header pad and F-2's pad to a multiple of 8. */
+static void zsi_sink_zeros(struct zsi_sink *s, size_t n)
+{
+    char *at = zsi_sink_claim(s, n);
+
+    if (at) memset(at, 0, n);
+}
+
+static uint64_t zsi_sink_digest(struct zsi_sink *s)
+{
+    if (!s->stream)                    return s->digest;   /* the one call */
+    if (s->csum_id == ZSI_CSUM_XXHASH) return XXH3_64bits_digest(&s->st);
+    return 0;                                        /* engine 0 (F-5b) */
+}
+
+/* Emit the body and fill the trailer.
+ *
+ * The pointer region goes into one sink and the keys and values regions into
+ * ANOTHER, single sink -- because F-33 checksums those two as one run and a sink
+ * hashes what passes through it in order, so entries first and then values gives
+ * the digest F-33 defines with no second pass and nothing held.
+ *
+ * Two walks over the descriptors, in the same order, so every destination offset
+ * is a running sum: the entries with their valptrs already absolute, then the
+ * value bytes, each copied straight from the mapping the record was read from.
+ *
+ * fd < 0 emits into *bodyp instead, one buffer with the sections abutting exactly
+ * as they do in the file; the caller frees it. */
+static int zsi_inorder_emit(struct zsi_inorder_out *w,
+                            const struct zsi_layout *lay,
+                            zs_csum *csum, unsigned csum_id, size_t budget,
+                            int fd, char **bodyp, char *trailer)
+{
+    struct zsi_sink ptrs, data;
+    char *body = NULL;
+    size_t i, koff = 0, voff = 0;
+    size_t phdr = lay->ptr_wide ? 16 : 8;
+    size_t pper = lay->ptr_wide ? 8 : 4;
+    size_t praw = phdr + pper * (w->nents + 1);
+    int r;
+
+    if (w->failed) return ZS_INTERNAL;
+    if (bodyp) *bodyp = NULL;
+
+    if (fd < 0) {
+        size_t total;
+        if (!zsi_add3_sz(lay->seclen, lay->keys_len, lay->values_len, &total))
+            return ZS_BADFORMAT;
+        body = malloc(total ? total : 1);
+        if (!body) return ZS_INTERNAL;
+    }
+
+    r = zsi_sink_init(&ptrs, fd, (off_t)ZSI_HEADER_LEN, lay->seclen, budget,
+                      body, csum, csum_id);
+    if (r != ZS_OK) { free(body); return r; }
+    r = zsi_sink_init(&data, fd, (off_t)lay->keys_off,
+                      lay->keys_len + lay->values_len, budget,
+                      body ? body + lay->seclen : NULL, csum, csum_id);
+    if (r != ZS_OK) { zsi_sink_fini(&ptrs); free(body); return r; }
+
+    /* The pointer region's header (F-26): its type byte, its record count, and
+     * the pad between them that F-26d requires to be zero. */
+    {
+        char h[16];
+        memset(h, 0, sizeof(h));
+        if (lay->ptr_wide) {
+            h[0] = (char)ZSI_PTRS64;
+            zsi_put64(h + 8, (uint64_t)w->nents);
+        } else {
+            h[0] = (char)ZSI_PTRS32;
+            zsi_put32(h + 4, (uint32_t)w->nents);
+        }
+        zsi_sink_put(&ptrs, h, phdr);
+    }
+
+    /* The entries and their offsets, then the sentinel -- keylen 0, valptr one
+     * past the values region, which is what makes F-36's derivation
+     * unconditional for the last record (F-36a). */
+    for (i = 0; i <= w->nents; i++) {
+        bool sentinel = (i == w->nents);
+        const struct zsi_inorder_ent *e = sentinel ? NULL : &w->ents[i];
+        size_t keylen = sentinel ? 0 : e->keylen;
+        size_t enclen = zsi_kent_encoded_len(keylen, lay->val_wide);
+        uint64_t abs = (uint64_t)(lay->keys_off + koff);
+        uint64_t valptr = (uint64_t)lay->values_off
+                        + (sentinel ? lay->values_len : voff);
+        char *at = zsi_sink_claim(&ptrs, pper);
+
+        if (!at) break;
+        if (lay->ptr_wide) zsi_put64(at, abs);
+        else               zsi_put32(at, (uint32_t)abs);
+
+        at = zsi_sink_claim(&data, enclen);
+        if (!at) break;
+        zsi_kent_encode(at, sentinel ? NULL : e->key, keylen,
+                        !sentinel && e->val == NULL, valptr, lay->val_wide);
+
+        koff += enclen;
+        if (!sentinel && e->val) voff += e->vallen + 1;
+    }
+
+    zsi_sink_zeros(&ptrs, lay->seclen - praw);       /* F-2's pad */
+
+    /* The values, in the same order, each straight from where it was read. */
+    for (i = 0; i < w->nents && data.err == ZS_OK; i++) {
+        const struct zsi_inorder_ent *e = &w->ents[i];
+        if (!e->val) continue;                       /* a deletion (F-37) */
+        zsi_sink_value(&data, e->val, e->vallen);
+    }
+
+    zsi_sink_flush(&ptrs);
+    zsi_sink_flush(&data);
+
+    r = ptrs.err != ZS_OK ? ptrs.err : data.err;
+    if (r == ZS_OK) {
+        /* Trailer: the data checksum over the keys and values regions as ONE run
+         * (F-33), then the pointer region's (F-34).  Neither covers the other. */
+        zsi_put64(trailer, zsi_sink_digest(&data));
+        zsi_put64(trailer + 8, zsi_sink_digest(&ptrs));
+        if (bodyp) { *bodyp = body; body = NULL; }
+    }
+
+    zsi_sink_fini(&ptrs);
+    zsi_sink_fini(&data);
+    free(body);
+    return r;
 }
 
 /********** PRIVATE INDEX *************/
@@ -5439,6 +5775,7 @@ struct zs_db {
     size_t       rollover_size;
     size_t       rollover_txns;      /* D-9d, A-15 */
     size_t       repack_max_size;    /* D-16, A-16 */
+    size_t       merge_memory;       /* D-20c, A-20 */
     void       (*error)(const char *msg, const char *fmt, ...);
 
     /* A-17.  Plain arithmetic, no atomics: a handle is not thread-safe anyway
@@ -6422,7 +6759,6 @@ static int zsi_cursor_next(struct zs_cursor *c, struct zsi_rec *out)
 /********** WRITE PATH *************/
 
 /* Defined further down this section; the streaming store needs them first. */
-static int zsi_write_all(int fd, const char *buf, size_t len);
 static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp);
 
 /* A transaction's own uncommitted records: an ordered KEY -> OFFSET index over
@@ -7297,24 +7633,6 @@ static int zsi_convert_one(struct zs_db *db, struct zsi_file *f);
 static int zsi_remove_file(struct zs_db *db, const char *name);
 static int zsi_convert_one(struct zs_db *db, struct zsi_file *f);
 
-/* Append bytes to a file descriptor, retrying a short write. */
-static int zsi_write_all(int fd, const char *buf, size_t len)
-{
-    size_t off = 0;
-
-    while (off < len) {
-        ssize_t n = ZS_WRITE(fd, buf + off, len - off);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return ZS_IOERROR;
-        }
-        if (n == 0) return ZS_IOERROR;
-        off += (size_t)n;
-    }
-
-    return ZS_OK;
-}
-
 /* Choose the file a write transaction will append to (D-9).
  *
  * While holding the write lock, a writer MUST either append to a CLEAN active
@@ -8094,7 +8412,13 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
      * A conversion keeps EVERY record it is given, tombstones included, and
      * must: its output covers its input's range (D-5a), so there is nothing
      * below it that it is entitled to reason about.  D-19's retention test
-     * belongs to repack, which merges a range and can look under it. */
+     * belongs to repack, which merges a range and can look under it.
+     *
+     * The record count is exact, so the descriptor array is sized once.  Nothing
+     * else is reserved: the keys and values stay where they are, in the input's
+     * mapping, until the emit copies them out. */
+    zsi_inorder_reserve(&body, n);
+
     for (size_t i = 0; i < n; i++) {
         const char *b = zsi_file_at(src, offs[i], 1);
         struct zsi_rec rec;
@@ -8107,38 +8431,35 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
         if (r != ZS_OK) goto fail;
     }
 
-    char *sec = NULL;
-    const char *vals = NULL;
-    size_t seclen = 0, vals_len = 0;
+    struct zsi_layout lay;
     char trailer[ZSI_TRAILER_LEN];
-    uint64_t keys_len = 0, values_len = 0;
-    bool val_wide = false;
-    r = zsi_inorder_finish(&body, cs, db->create_csum_id, &sec, &seclen,
-                           &vals, &vals_len, trailer, &keys_len, &values_len,
-                           &val_wide);
+    r = zsi_inorder_layout(&body, &lay);
     if (r != ZS_OK) goto fail;
 
     memset(&h, 0, sizeof(h));
     h.version_read = ZSI_VERSION_READ;
     h.version_write = ZSI_VERSION_WRITE;
     h.flags = (uint16_t)db->create_csum_id;
-    if (val_wide) h.flags |= ZSI_HDR_FLAG_WIDEVAL;
+    if (lay.val_wide) h.flags |= ZSI_HDR_FLAG_WIDEVAL;
     memcpy(h.uuid, db->uuid, 16);
     h.start = start;
     h.end = end;
     memcpy(h.compar_name, db->compar_name, ZSI_COMPAR_NAME_LEN);
-    h.keys_len = keys_len;
-    h.values_len = values_len;
+    h.keys_len = lay.keys_len;
+    h.values_len = lay.values_len;
     zsi_header_encode(hdr, &h, cs);
 
     r = zsi_staging_open(db, sname, &fd);
-    if (r != ZS_OK) { free(sec); goto fail; }
+    if (r != ZS_OK) goto fail;
 
+    /* The header states every section's length before a body byte is written
+     * (D-20c), then the emit streams the body out of the input's mapping. */
     r = zsi_write_all(fd, hdr, sizeof(hdr));
-    if (r == ZS_OK) r = zsi_write_all(fd, sec, seclen);
-    if (r == ZS_OK && vals_len) r = zsi_write_all(fd, vals, vals_len);
-    if (r == ZS_OK) r = zsi_write_all(fd, trailer, sizeof(trailer));
-    free(sec);
+    if (r == ZS_OK)
+        r = zsi_inorder_emit(&body, &lay, cs, db->create_csum_id,
+                             db->merge_memory, fd, NULL, trailer);
+    if (r == ZS_OK)
+        r = zsi_write_at(fd, trailer, sizeof(trailer), (off_t)lay.values_end);
 
     /* The file's contents durable BEFORE the rename, or the name could exist
      * pointing at a partial file after a crash -- in every durability mode
@@ -8164,8 +8485,7 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
      * caller is a conversion, which is why this lands in convert_* -- a second
      * caller would have to say which bucket it belongs in. */
     db->stats.convert_records += (uint64_t)n;
-    db->stats.convert_bytes += (uint64_t)ZSI_HEADER_LEN + seclen
-                             + vals_len + ZSI_TRAILER_LEN;
+    db->stats.convert_bytes += (uint64_t)lay.values_end + ZSI_TRAILER_LEN;
 
     /* C-6: fdatasync the DIRECTORY after renaming an output into place, otherwise
      * the name may be absent after a crash even though the contents are durable.
@@ -8594,6 +8914,21 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
         }
     }
 
+    /* Size the descriptor array from the inputs' record counts: the output holds
+     * at most one record per input record, since resolution only ever drops
+     * them (D-17, D-19).  The keys and values themselves stay in the inputs'
+     * mappings until the emit copies them out, which is why nothing else here
+     * scales with the merge's bytes. */
+    {
+        size_t nrecs = 0;
+        for (size_t i = 0; i < count; i++) {
+            const struct zsi_file *in = snap->files[first + i];
+            if (in->nptrs > SIZE_MAX - nrecs) { nrecs = 0; break; }
+            nrecs += (size_t)in->nptrs;
+        }
+        zsi_inorder_reserve(&body, nrecs);
+    }
+
     fc = zsi_zmalloc(count * sizeof(*fc));
     if (!fc) return ZS_INTERNAL;
 
@@ -8665,38 +9000,35 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
      * short-lived: an empty file violates D-16's size relation maximally, so the
      * next repack absorbs it. */
 
-    char *sec = NULL;
-    const char *vals = NULL;
-    size_t seclen = 0, vals_len = 0;
+    struct zsi_layout lay;
     char trailer[ZSI_TRAILER_LEN];
-    uint64_t keys_len = 0, values_len = 0;
-    bool val_wide = false;
-    r = zsi_inorder_finish(&body, cs, db->create_csum_id, &sec, &seclen,
-                           &vals, &vals_len, trailer, &keys_len, &values_len,
-                           &val_wide);
+    r = zsi_inorder_layout(&body, &lay);
     if (r != ZS_OK) goto out;
 
     memset(&h, 0, sizeof(h));
     h.version_read = ZSI_VERSION_READ;
     h.version_write = ZSI_VERSION_WRITE;
     h.flags = (uint16_t)db->create_csum_id;
-    if (val_wide) h.flags |= ZSI_HDR_FLAG_WIDEVAL;
+    if (lay.val_wide) h.flags |= ZSI_HDR_FLAG_WIDEVAL;
     memcpy(h.uuid, db->uuid, 16);
     h.start = out_start;
     h.end = out_end;
     memcpy(h.compar_name, db->compar_name, ZSI_COMPAR_NAME_LEN);
-    h.keys_len = keys_len;
-    h.values_len = values_len;
+    h.keys_len = lay.keys_len;
+    h.values_len = lay.values_len;
     zsi_header_encode(hdr, &h, cs);
 
     r = zsi_staging_open(db, sname, &fd);
-    if (r != ZS_OK) { free(sec); goto out; }
+    if (r != ZS_OK) goto out;
 
+    /* The header states every section's length before a body byte is written
+     * (D-20c), then the emit streams the body out of the inputs' mappings. */
     r = zsi_write_all(fd, hdr, sizeof(hdr));
-    if (r == ZS_OK) r = zsi_write_all(fd, sec, seclen);
-    if (r == ZS_OK && vals_len) r = zsi_write_all(fd, vals, vals_len);
-    if (r == ZS_OK) r = zsi_write_all(fd, trailer, sizeof(trailer));
-    free(sec);
+    if (r == ZS_OK)
+        r = zsi_inorder_emit(&body, &lay, cs, db->create_csum_id,
+                             db->merge_memory, fd, NULL, trailer);
+    if (r == ZS_OK)
+        r = zsi_write_at(fd, trailer, sizeof(trailer), (off_t)lay.values_end);
     /* Durable before the rename, in every durability mode (C-6b). */
     if (r == ZS_OK && ZS_FDATASYNC(fd) < 0) r = ZS_IOERROR;
     close(fd);
@@ -8716,8 +9048,7 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
      * asking "how much did I rewrite" means, and counting it would make the
      * numbers move on failures that changed nothing. */
     db->stats.repack_records += (uint64_t)nptrs;
-    db->stats.repack_bytes += (uint64_t)ZSI_HEADER_LEN + seclen
-                            + vals_len + ZSI_TRAILER_LEN;
+    db->stats.repack_bytes += (uint64_t)lay.values_end + ZSI_TRAILER_LEN;
 
     {                                           /* C-6, every mode (C-6b) */
         int dfd = open(db->dir, O_RDONLY);
@@ -9451,6 +9782,8 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
                                              : ZSI_DEFAULT_ROLLOVER_TXNS;
     db->repack_max_size = setup->repack_max_size ? setup->repack_max_size
                                                  : ZSI_DEFAULT_REPACK_MAX;
+    db->merge_memory = setup->merge_memory ? setup->merge_memory
+                                           : ZSI_DEFAULT_MERGE_MEMORY;
     db->error = setup->error ? setup->error : zsi_default_error;
     db->external_csum = setup->csum;
     db->create_csum_id = zsi_csum_id_for_flags(setup->flags);
