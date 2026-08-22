@@ -1,5 +1,73 @@
-source: fac755a
-date: 2026-08-22 (library 3.1.0, and 3.0.1 with it -- our two findings from
+source: f365bc4
+date: 2026-08-22 (library 3.1.1 -- xxhash stops being pessimised, and hashing
+      is about 3x faster for it.  Our finding, taken upstream and released the
+      same day.  No format, digest or API change: both flags affect INLINING
+      only, and upstream's corpus and interop-constant tests pin the bytes
+      either way.
+
+      ZEROSKIP.C SET XXH_NO_INLINE_HINTS UNCONDITIONALLY, which turns every
+      internal xxhash function into a plain static.  On modern compilers that
+      costs ~3x on ALL hashing -- one-shot as well as streaming, so every span
+      checksum, conversion, repack and consistency check was paying it.  21MB
+      on aarch64: gcc 14 19.4 -> 59.0 GB/s, clang 19 24.3 -> 62.5.  End to end,
+      zsbench at 400k/1000-per-txn, best of nine: gcc 1107k -> 1202k/s, clang
+      1122k -> 1205k/s.  Best-of-N deliberately -- interference is one-sided and
+      the flagged arm's spread was several times the effect.
+
+      THE OLD COMMENT'S REASON WAS REAL BUT MISATTRIBUTED.  Not SSE2 and not
+      every build: gcc refuses xxhash's always_inline NEON helpers at -Og
+      ("function not considered for inlining") and hits an INTERNAL COMPILER
+      ERROR at -O1 on aarch64.  clang is clean at every level.  So the flag now
+      lives only on upstream's low-optimisation targets (XXH_LOWOPT_DEF, used by
+      asan and leaks).  A hand-rolled -Og build fails loudly instead, which is
+      the right way round.  Nothing in THIS tree builds zeroskip.c below -O2:
+      it is not in the amalgamation (so dbfuzz2's -O0 never touches it), our
+      only -O1 is jimsh, and xxhash self-protects at -O0 via __NO_INLINE__.
+
+      XXH3_STREAM_USE_STACK IS NOW SET EXPLICITLY.  xxhash defines it for every
+      compiler EXCEPT clang -- "clang doesn't need additional stack space",
+      which is wrong: without it clang leaves the eight accumulator lanes in the
+      heap-allocated state rather than in registers, and streaming runs at a
+      third of one-shot (clang 19: 20.3 vs 62.5 GB/s).  With it, 63.2 vs 61.0.
+      THAT LARGELY RETIRES THE merge_memory TRADE recorded below.  Verified on
+      the shipped code rather than on the hand-patch that found it -- 2M
+      records, four passes per arm, order alternated:
+
+                          3.1.0        3.1.1
+          default   store 1683-1716k  1711-1743k   merge 559-581  541-567  RSS 318MB
+          mm=1GB    store 1731-1766k  1764-1777k   merge 547-558  517-548  RSS 619MB
+
+      3.1.1's DEFAULT arm (541-567ms) now overlaps what 3.1.0 needed 619MB to
+      reach (547-558), and overlaps format 2's 520-556 -- so we are at format-2
+      merge speed at 318MB.  Holding still shows a small edge (517-548), but the
+      ranges overlap and it costs 2x the memory.  Keep the default.  The
+      zs_merge_memory knob stays: it is still the lever for bounding a
+      compaction, which is why 3.1.0 added it.
+
+      CAREFUL WITH THE 3x ON THIS LAPTOP: Apple clang does NOT show the
+      one-shot penalty (52.3 vs 51.9 GB/s), only the streaming one, so the
+      engine numbers above move much less than the 8% zsbench showed under
+      Linux gcc/clang.  The big win is a LINUX-TOOLCHAIN win and production is
+      where it should show; do not quote the 8% from a macOS run.
+
+      TWOM WAS CHECKED AND NEEDS NOTHING.  It sets the same flag for a different
+      stated reason (-Og), and it is unaffected either way: it only ever calls
+      one-shot XXH3_64bits on record HEADERS of a few dozen bytes, which take
+      XXH3's short-input path rather than the vectorized accumulate loop the
+      flag pessimises.  Measured both ways -- 304 M hashes/s at 24 and 64 bytes,
+      identical to three digits on gcc and clang, identical digests -- and its
+      benchmark rows (fillseq, fillrandom, overwrite, repack, readrandom) are
+      flat in both directions on both compilers.  The flag is also not needed
+      for its -Og build, since the streaming helpers that fail to inline are
+      never instantiated there.  Left alone: no measured reason to touch it.
+
+      Test tier, all green on 3.1.1: zskey-test, zsbtree-test, the 10 SQL
+      batteries, format-guard (8 cases), crash-test 10 rounds, busy-test,
+      backup-concurrent, 966/966 through the TCL permutation, twowriter 6/6 and
+      metacache 8/8.  Upstream's own suite passes at the default -O2 with no
+      flag under gcc 14 AND clang 19 on Debian trixie, and on macOS.
+
+      Below: 3.1.0, and 3.0.1 with it -- our two findings from
       yesterday, confirmed and fixed upstream, plus a memory bound we did not
       ask for and want more than either.  No format change; 3.0.0 files are
       read unchanged, and "no file byte changes" is upstream's own assertion
