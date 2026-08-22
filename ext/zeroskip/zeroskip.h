@@ -71,12 +71,14 @@ enum zs_ret {
 enum zs_flagspec {
     ZS_CREATE        = 1<<0,   /* open:    create the database if absent */
     ZS_SHARED        = 1<<1,   /* open,txn: read-only */
-    ZS_NOCSUM        = 1<<2,   /* open:    skip record-checksum verification
-                                  at materialization (F-5e) -- and nothing
-                                  else.  Span checksums are still verified
-                                  whenever a span is indexed, so crash
-                                  recovery and torn-tail detection (F-22,
-                                  C-4f) hold in every mode. */
+    /* 1<<2 was ZS_NOCSUM, which skipped per-record verification at
+       materialization.  No record carries a checksum in format 3 (F-13a) and an
+       in-order file's regions are never verified on a read path (F-33a), so the
+       flag has nothing left to select.  RESERVED, not reused, and REJECTED
+       rather than ignored: a caller passing it believes it is weakening
+       verification and is entitled to be told the request is meaningless
+       (A-18). */
+    ZS_RESERVED_NOCSUM = 1<<2,
     ZS_NOSYNC        = 1<<3,   /* open:    omit both durability gates on commit,
                                   and nothing else (C-7c).  Structure is still
                                   synced (C-6b), so a crash costs at most the
@@ -168,7 +170,7 @@ typedef int      zs_cb(void *rock, const char *key, size_t keylen,
                        const char *val, size_t vallen);
 typedef int      zs_compar(const char *a, size_t alen,
                            const char *b, size_t blen);
-typedef uint32_t zs_csum(const char *buf, size_t len);
+typedef uint64_t zs_csum(const char *buf, size_t len);
 
 struct zs_open_data {
     uint32_t     flags;
@@ -387,7 +389,7 @@ const char *zs_strerror(int r);
  *
  * Rebuilds whatever is readable out of a DAMAGED directory into a new database.
  * It reads structures the ordinary path refuses -- a file set with a gap, a
- * header that does not validate, a pointer section that will not load, spans
+ * header that does not validate, a pointer region that will not load, spans
  * after a bad one -- because those are exactly the databases worth salvaging.
  *
  * The source is never written to, never locked, and never unlinked from (S-1).
@@ -406,12 +408,20 @@ enum zs_salvage_kind {
     ZS_SALVAGE_HEADER_INVALID,    /* generation taken from the filename */
     ZS_SALVAGE_ENGINE_GUESSED,    /* which engine the spans validated under */
     ZS_SALVAGE_GAP,               /* a generation range absent from the set */
-    ZS_SALVAGE_PTRS_IGNORED,      /* pointer section unusable; order rescanned */
+    ZS_SALVAGE_PTRS_IGNORED,      /* pointer region unusable; the keys region
+                                     was walked directly instead (S-6) */
     ZS_SALVAGE_SPAN_LOST,         /* a span that could not be verified */
     ZS_SALVAGE_SPAN_ROLLBACK,     /* deliberately aborted; not recovered */
     ZS_SALVAGE_RESYNC,            /* a verified span found after damage */
     ZS_SALVAGE_KEY_UNVERIFIED,    /* value came from an unverifiable span */
-    ZS_SALVAGE_KEY_MAYBE_STALE    /* a newer version may have been in lost bytes */
+    ZS_SALVAGE_KEY_MAYBE_STALE,   /* a newer version may have been in lost bytes */
+    ZS_SALVAGE_REGION_UNVERIFIED  /* an in-order file's data region failed its
+                                     checksum, so EVERY key in it is
+                                     unverifiable (S-13).  Reported once per
+                                     FILE, never per key: with only a region
+                                     checksum there is no per-record verdict to
+                                     report, and a file holding millions of keys
+                                     would emit millions of events (A-19). */
 };
 
 struct zs_salvage_event {

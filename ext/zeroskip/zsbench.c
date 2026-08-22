@@ -573,12 +573,12 @@ static void bench_batched_store(void)
      * fillseq uses.  Without it the closest zsbench figure commits every 1000,
      * so a side-by-side bulk-load row compared batching policy rather than the
      * two libraries -- 20 commits and 40 fdatasyncs against one and two. */
-    for (int per = 10; per <= nrecs * 10; per *= 10) {
+    for (long long per = 10; per <= (long long)nrecs * 10; per *= 10) {
         char label[64], slug[64];
         struct reptimes rt = { {0}, 0 };
         if (per > nrecs) per = nrecs;
         snprintf(label, sizeof(label), per == nrecs ? "store, all in one txn"
-                                                    : "store, %d per txn", per);
+                                                    : "store, %lld per txn", per);
         if (!selected(label)) { if (per == nrecs) break; else continue; }
 
         for (int r = 0; r < reps; r++) {
@@ -604,7 +604,7 @@ static void bench_batched_store(void)
         }
 
         if (per == nrecs) snprintf(slug, sizeof(slug), "store_all_per_txn");
-        else              snprintf(slug, sizeof(slug), "store_%d_per_txn", per);
+        else              snprintf(slug, sizeof(slug), "store_%lld_per_txn", per);
         record(slug, label, (size_t)nrecs, &rt, "");
         if (per == nrecs) break;    /* the sweep ends at "all" */
     }
@@ -943,7 +943,7 @@ static void bench_fetch(void)
                 char k[ZSB_KEYMAX];
                 const char *v;
                 size_t vl;
-                makekey(k, sizeof(k), (i * 7919) % nrecs);
+                makekey(k, sizeof(k), (i * 7919LL) % nrecs);
                 if (zs_db_fetch(db, k, strlen(k), NULL, NULL, &v, &vl, 0) == ZS_OK)
                     hits++;
             }
@@ -1051,22 +1051,11 @@ static void bench_scan(void)
     bench_scan_once(db, "scan_compacted", "full scan, compacted");
     zs_db_close(&db);
 
-    /* The SAME fixture, read with verification off (A-?/F-32a): the only
-     * difference is the read-side flag, not the engine the file records, so
-     * this is what a caller can actually choose.
-     *
-     * It is the largest single item in a scan profile, and much larger than
-     * that profile suggests: a key-only traversal never dereferences the value
-     * a cursor hands back, so without verification those bytes are never read
-     * at all, while verifying pulls every one of them into cache.  The cost is
-     * memory traffic rather than mixing -- which is also why a faster hash
-     * would buy little here, and why this line is the honest way to price the
-     * flag.  Span checksums are unaffected: they ride indexing (F-5e) and run
-     * in every mode. */
-    fixture_require(plain);
-    db = open_at(plain, ZS_NOCSUM, 0);
-    bench_scan_once(db, "scan_noverify", "full scan, no verify");
-    zs_db_close(&db);
+    /* Format 2 had a `full scan, no verify` line here, opening the same fixture
+     * with ZS_NOCSUM to price what record verification cost.  No record carries
+     * a checksum now (F-13a) and an in-order file's regions are never verified
+     * on a read path (F-33a), so there is nothing left to switch off and nothing
+     * left to price: every scan above is already the no-verify scan. */
 
     fixture_done(plain);
     fixture_done(compacted);
@@ -1184,7 +1173,7 @@ static void bench_scan_merge(void)
  * a different machine from a file cursor: its position is a KEY rather than an
  * index (D-14j-a), so each step re-resolves it by binary search over the
  * pending array, and each record is decoded back out of the active file through
- * the transaction's mappings rather than read straight from a pointer section.
+ * the transaction's mappings rather than read straight from a keys region.
  *
  * It exists for the same reason bench_read_after_write does, one level up.  That
  * one covers point reads inside a write transaction; nothing covered a WALK, so
@@ -1824,7 +1813,7 @@ static void bench_compact(void)
                 makekey(k, sizeof(k), i);
                 zs_db_store(db, k, strlen(k), val, valsize, 0);
             }
-            for (int i = 0; i < nrecs * deleted_pct[t] / 100; i++) {
+            for (int i = 0; i < (long long)nrecs * deleted_pct[t] / 100; i++) {
                 char k[ZSB_KEYMAX];
                 makekey(k, sizeof(k), i);
                 zs_db_delete(db, k, strlen(k), 0);

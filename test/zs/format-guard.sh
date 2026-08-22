@@ -74,6 +74,35 @@ if [ -d "$(dirname "$0")/fixtures/oldfmt-db" ]; then
   expect "pre-format-change database opens as empty (see header)" "0" "$out"
 fi
 
+# 4b. a database in on-disk FORMAT 2, written by library 2.9.1 (the
+#    version vendored immediately before format 3).  Distinct from case 4:
+#    that fixture is an older FILE NAMING layout, this one is the current
+#    naming with the previous FORMAT -- the magic's major version digit is
+#    '1' where a 3.0.0 writer puts '2'.  Regenerable, unlike case 4's:
+#    build zskvbench against the 2.9.1 sources and run --build-only.
+#
+#    The fixture holds a real 50-row `kv` table and its schema is still
+#    legible in the file (`strings` finds the CREATE TABLE), so a count of
+#    0 here is the engine declining to read data that is demonstrably
+#    present -- not an empty fixture passing vacuously.  Upstream rejects a
+#    foreign format at the magic (F-6b, R-6) and implements no migrator,
+#    which at this layer surfaces as an EMPTY database rather than an
+#    error.  Nothing has ever shipped on format 2 so nothing needs
+#    carrying forward, but a leftover benchmark or test directory from
+#    before 2026-08-21 will read empty and a write will start a fresh
+#    generation beside data still on disk.  If a version mismatch ever
+#    becomes a hard error, this expectation flips.
+if [ -d "$(dirname "$0")/fixtures/fmt2-db" ]; then
+  cp -r "$(dirname "$0")/fixtures/fmt2-db" "$W/dbfmt2"
+  chmod -R u+w "$W/dbfmt2"
+  out=$($SH "$W/dbfmt2" "SELECT count(*) FROM sqlite_master;" 2>&1)
+  expect "format-2 database opens as empty (see header)" "0" "$out"
+  # The bytes are still there: this asserts the fixture is not merely an
+  # empty directory, which would make the case above pass for free.
+  n=$(strings "$W"/dbfmt2/*.current 2>/dev/null | grep -c "CREATE TABLE kv")
+  expect "...with its schema still on disk, unread" "1" "$n"
+fi
+
 # 5. a database created by THIS build reopens cleanly (the trivial case
 #    that a format change must not break)
 $SH "$W/db4" "CREATE TABLE t(a INTEGER PRIMARY KEY, b); INSERT INTO t VALUES(1,'x');" >/dev/null 2>&1

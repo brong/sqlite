@@ -104,7 +104,12 @@ struct Btree {
   u8 isReadonly;                /* opened with SQLITE_OPEN_READONLY */
   u8 inBackup;                  /* sqlite3BtreeIsInBackup */
   u8 uriNoSync;                 /* URI zs_nosync=1: open with ZS_NOSYNC */
-  u8 uriNoCsum;                 /* URI zs_nocsum=1: skip read verification */
+  /* There was a uriNoCsum here (URI zs_nocsum=1 -> ZS_NOCSUM).  Format 3
+  ** removed the flag: no record carries a checksum (F-13a) and an in-order
+  ** file's regions are never verified on a read path (F-33a), so there is
+  ** nothing left to switch off.  The library REJECTS the bit rather than
+  ** ignoring it (A-18), so the parameter had to go rather than become inert.
+  ** The trade it used to buy is now unconditional -- see the doc. */
   sqlite3_int64 uriRollover;    /* URI zs_rollover=BYTES: generation size, 0 =
                                 ** the library's 2MB default.  Bytes only --
                                 ** see zsbtEnsureOpen for why the span bound
@@ -526,7 +531,6 @@ static int zsbtEnsureOpen(Btree *p){
   ** which fired on nearly every commit and spent write throughput to buy
   ** a read latency the workload had not asked for. */
   if( p->isEphemeral || p->uriNoSync ) setup.flags |= ZS_NOSYNC;
-  if( p->uriNoCsum ) setup.flags |= ZS_NOCSUM;
   /* zs_norepack takes the cascade OFF the write path entirely.  Not a
   ** default and not a mode to leave on: the file count then grows without
   ** limit until something calls the catch-up, and point-lookup cost is
@@ -662,7 +666,6 @@ int sqlite3BtreeOpen(
         p->uriNoSync = 1;
         p->syncMs = (int)sqlite3_uri_int64(zFilename, "zs_sync_ms", 0);
       }
-      p->uriNoCsum = (u8)sqlite3_uri_boolean(zFilename, "zs_nocsum", 0);
       p->uriNoRepack = (u8)sqlite3_uri_boolean(zFilename, "zs_norepack", 0);
       p->uriRollover = sqlite3_uri_int64(zFilename, "zs_rollover", 0);
       p->uriRolloverTxns = sqlite3_uri_int64(zFilename, "zs_rollover_txns", 0);

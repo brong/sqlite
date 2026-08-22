@@ -587,10 +587,17 @@ static void bench_fetch_and_scan(void){
   t0 = now();
   for(i=0; i<nrecs; i++){
     char k[32];
+    /* 7919LL, not 7919: as an int this product overflows above n = 271181,
+    ** and past that about half the indices wrap negative, so the row times a
+    ** hit/miss MIXTURE under a label claiming the hit path -- and the miss
+    ** half is the cheaper one.  Upstream hit the identical bug in zsbench
+    ** (6fe9862) and this copy of the idiom carried it.  Below the threshold
+    ** the widened expression is arithmetically identical, so figures already
+    ** recorded at 200k stay comparable. */
     if( bRowid ){
-      sqlite3_bind_int64(pSel, 1, (sqlite3_int64)((i*7919)%nrecs) + 1);
+      sqlite3_bind_int64(pSel, 1, (sqlite3_int64)((i*7919LL)%nrecs) + 1);
     }else{
-      snprintf(k, sizeof(k), "key%08d", (i*7919)%nrecs);
+      snprintf(k, sizeof(k), "key%08d", (int)((i*7919LL)%nrecs));
       sqlite3_bind_text(pSel, 1, k, -1, SQLITE_TRANSIENT);
     }
     if( sqlite3_step(pSel)==SQLITE_ROW ) hits++;

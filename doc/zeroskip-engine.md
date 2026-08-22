@@ -129,9 +129,15 @@ across arms.
 Two plausible savings in our glue were measured and are NOT worth
 taking:
 
-- `zs_nocsum=1` buys 2.8% (22.8M -> 23.4M rows/s).  XXH3 looks like 13%
-  of the profile, but F-5e narrows ZS_NOCSUM to RECORD checksums while
-  span verification always runs, so most of it is not skippable.
+- `zs_nocsum=1` bought 2.8% (22.8M -> 23.4M rows/s).  XXH3 looked like
+  13% of the profile, but F-5e narrowed ZS_NOCSUM to RECORD checksums
+  while span verification always ran, so most of it was not skippable.
+  **Both the knob and the measurement are now void** (library 3.0.0):
+  no record carries a checksum at all (F-13a) and an in-order file's
+  regions are never verified on a read path (F-33a), so that 2.8% is
+  had unconditionally and there is nothing left to switch off.  The URI
+  parameter is gone -- the library REJECTS the bit rather than ignoring
+  it (A-18), so leaving it as an inert alias was not an option.
 - Removing the per-row key mirror buys nothing (22.5M vs 22.8M), the
   same answer as when it was measured against the older library.
 
@@ -1588,6 +1594,92 @@ the code cannot behave differently there -- but a 2.4% "result" with clean
 separation is exactly what a fixed arm order manufactures, and interleaving
 must alternate direction as well as arms.
 
+#### Format 3 (library 3.0.0): reads up, bulk store down, and the accounting closes
+
+An in-order file stopped storing records and started storing
+`[header][pointers][keys][values][trailer]` -- a dense array of key
+entries carrying a pointer into an unframed values region, so a seek
+walks a structure smaller than the old records region by roughly the
+value:key size ratio.  Formats reject each other at the magic and there
+is no migrator.  **The engine needed no port**, which is the first real
+test of that claim; the only change that reached us was API, not format
+(`ZS_NOCSUM` removed, so `zs_nocsum=1` went with it -- see "Scans").
+
+Reads, raw `zsbench` at 500k records, 4 passes per arm with the arm
+order alternated.  The baseline is **6fe9862**, format 2 carrying the
+benchmark fix but not the format, which is upstream's own pairing and
+is load-bearing -- see the trap below:
+
+| row | 2.9.1 (fmt 2) | 3.0.0 (fmt 3) | |
+|---|---:|---:|---:|
+| fetch (6 files)           | 456-473k/s | 526-548k/s | +11..20% |
+| fetch (6 files, repacked) | 418-441k/s | 472-486k/s | +7..16%  |
+| full scan                 | 51.4-52.2M | 69.0-75.6M | +32..47% |
+| full scan, compacted      | 61.2-62.6M | 90.9-91.7M | +45..50% |
+| full scan, interleaved    | 39.1-42.0M | 50.2-52.6M | +20..35% |
+| full scan, shadowed       | 30.4-35.2M | 43.0-44.9M | +22..48% |
+
+Upstream measures +14% on the repacked fetch and +37% on the compacted
+scan; we land on or above both.  `full scan, no verify` is gone as a
+row -- there is nothing left for it to skip.  `full scan, shadowed` is
+the one disagreement: upstream reports it DOWN 5.4% with no mechanism
+attached and it is UP here.  Different host, neither side can explain
+it, so it stays flagged rather than averaged away.
+
+**Bulk store is down 10-13%, and the merge counters account for all of
+it.**  2M records at 1000-per-txn, rowid, through SQL, 6 passes per arm,
+order alternated: 1726-1746k/s -> 1520-1560k/s.  The instrumented
+counters are far quieter than the wall clock and say identical BYTES,
+more TIME:
+
+    conversions   117, 263MB, 123-127ms -> 117, 265MB, 170-176ms  +37%
+    repacks        40, 830MB, 393-427ms ->  39, 841MB, 497-532ms  +21%
+    merge total          516-554ms      ->       667-708ms       +150ms
+    the store row's own delta                                    +147ms
+
+Nothing is left over: the extra merge time IS the regression.
+Underneath us on upstream's own fixture, where the arms are quieter
+still, raw `store, 1000 per txn` goes 2406-2438k/s -> 2193-2201k/s
+(-9%) and `store, all in one txn` 4353-4451k -> 4200-4236k (-3..-5%).
+
+Upstream priced the CONVERSION half of this and declined to chase it --
+one 20MB conversion going 10.3ms -> 12.5ms, "about 2% of a bulk load
+that seals", against +19% on a scan, the cause being the builder's
+32-byte descriptor per record and its second pass where format 2
+encoded into one buffer in a single pass.  **Two things that figure
+misses at our scale, and they are what to send back:** the REPACK path
+pays the same builder cost (+21%, which upstream did not measure), and
+in a cascading bulk load repacks are ~3x the conversion bytes -- so the
+weighted cost is 150ms, not 2ms.
+
+Write amplification otherwise improves.  At 200k: WITHOUT ROWID 6.7x ->
+5.6x of stored at 100-per-txn and 6.9x -> 5.8x at 1000; rowid 1000/txn
+2.7x -> 2.3x.  One row goes the other way -- rowid at 100-per-txn, 2.7x
+-> 3.5x -- and it is a cascade BOUNDARY effect rather than a per-record
+cost: the same data at 1000-per-txn repacks 3 times for 27MB instead of
+4 for 36MB.  Deterministic per arm across every pass, both directions.
+
+**This laptop resolves nothing at 500k through SQL**, which is an
+instrument fact worth keeping.  Eight passes per arm on the full sweep:
+every row overlaps, including the store row that had clean separation
+at three passes.  The 2M result stands because merge work is a large
+enough share of that run to clear the noise.  Read the raw rows and the
+instrumented counters, not the SQL wall clock.
+
+**The trap this section nearly fell into.**  `test/zskvbench.c` carried
+the identical `(i * 7919) % nrecs` int overflow upstream fixed in
+6fe9862: above n = 271181 about half the products wrap, and the row
+times a hit/miss MIXTURE under a label claiming the hit path -- with
+the miss half the cheaper one.  Fixed here the same way.  It never
+corrupted a published number (every fetch figure in this document is at
+20k or 200k, and `prodrun.sh`'s large-n phases all pass `--only`, which
+runs no fetch), but the first `-n 500000` run would have.  It also
+nearly produced a wrong conclusion here: the first raw fetch A/B, run
+against the previous RELEASE rather than upstream's paired arm, showed
+format 3 losing -- because the format-2 arm was answering 271183
+lookups where format 3 answered 500000.  **A vendored benchmark carries
+vendored bugs; pair arms the way upstream paired theirs.**
+
 #### Arrival order costs a fixed ~5us per record, on both machines
 
 `zskvbench --random` stores the same key set in a scrambled order (a
@@ -2084,22 +2176,30 @@ compaction is the big read lever -- VACUUM (which now performs a real
 zs_db_compact after its rebuild commits; backup destinations compact
 on finish) takes point fetches from 190k/s to 372k/s, PAST stock's
 277k/s, because point-lookup cost is proportional to the file count
-(D-14d).  Read-side checksum verification costs ~12% of scan
-throughput through SQL and nothing measurable on fetches; `zs_nocsum=1`
-skips verification and `zs_csum=none` writes engine-0 files (both URI
-parameters, both opt-outs of a safety net the stock btree never had).
-Library 2.1.0's own `full scan, no verify` row prices the same thing
-underneath us, and on production hardware it is much larger there --
-19.6M against 25.1M records/s at 4K, so **22% of a RAW scan** -- which is
-consistent rather than contradictory: our scan spends most of its time in
-the VDBE, so the same absolute saving is a smaller share of it.
-As of upstream F-5e (266320e), ZS_NOCSUM skips only record-checksum
-verification at materialization -- span/terminator checksums are
-always verified -- so even zs_nosync+zs_nocsum together stays
-crash-safe: a reopen after a crash yields a valid prefix.
-Compacted, unverified scans reach 26.4M/s vs stock's 31M/s; the
-residual is record decode and merge stepping against packed page
-cells.
+(D-14d).
+
+**The read path no longer verifies anything, and that is not a knob any
+more** (library 3.0.0).  Records carry no checksum in either file kind
+(F-13a), and an in-order file's two region checksums are verified by
+`zs_db_check_consistency` and by a repack -- never on a read (F-33a).
+Between consistency checks, corrupt bytes in an in-order file are
+returned to us and we hand them to the VDBE.  That is upstream's stated
+trade (F-5e), taken deliberately, and it is a REDUCTION in what this
+engine offered over the stock btree: the historic pitch was a safety net
+stock never had, and the net is now cast at maintenance time rather than
+per read.  `zs_csum=none` (write engine-0 files) survives as the one
+remaining URI opt-out; `zs_nocsum=1` is gone with the flag.
+The prices below are what verification USED to cost and are kept as the
+size of what is now free rather than as live measurements: ~12% of scan
+throughput through SQL, nothing measurable on fetches, and 22% of a RAW
+scan on production hardware at 4K (19.6M against 25.1M records/s) --
+a bigger share there than here because our scan spends most of its time
+in the VDBE, so the same absolute saving is a smaller fraction of it.
+Crash safety is unaffected: span and terminator checksums keep their
+role in the active file, so a reopen after a crash still yields a valid
+prefix, with or without zs_nosync.
+Compacted scans reach 26.4M/s vs stock's 31M/s; the residual is record
+decode and merge stepping against packed page cells.
 
 History: an earlier vendored snapshot had per-commit cost growing
 linearly with active-file size (a snapshot rebuild on every write-txn
@@ -2159,22 +2259,41 @@ The engine has NO dependence on zeroskip's on-disk format: it never
 reads a file name, counts files, or knows the layout.  The only
 directory-level code is the recursive delete for ephemeral databases.
 A format change is therefore a re-vendor and a re-verify, not a port.
+**That was an assertion until 2026-08-21 and is now a measurement**:
+library 3.0.0 replaced the whole in-order file layout -- records became
+a dense key array pointing into an unframed values region -- and not one
+line of `btree_zs.c` moved for it.  The single change that did reach us
+came through the API, not the format (`ZS_NOCSUM` was removed, so the
+`zs_nocsum=1` URI parameter went with it).
+
 What to run, in order: a clean rebuild (`rm -f *.o libsqlite3.a` --
 make cannot see that OPTIONS changed), `zskey-test`, `zsbtree-test`,
 the SQL batteries, `format-guard.sh`, `crash-test.sh`, `busy-test.sh`,
 `backup-concurrent.sh`, then the full tier via `run-suite.sh`.
 
 The one thing a format change can break silently is a database written
-by the previous version: `format-guard.sh` records that an unreadable
-database currently opens as an EMPTY one rather than failing, so an old
-database met by a new library would look empty and the first write
-would start a fresh generation beside data still on disk.  If upstream
-makes a version mismatch a hard error, that test changes and should be
-updated to match -- deliberately.
+by the previous version, and `format-guard.sh` pins the behaviour with
+a checked-in fixture per transition -- `fixtures/oldfmt-db` for the
+pre-2026-08-14 file NAMING, `fixtures/fmt2-db` for the format that
+preceded format 3.  Both open as an EMPTY database rather than failing:
+no error, and a subsequent write starts a fresh generation beside data
+still on disk.  The fmt2 case asserts twice, because "reports zero
+tables" passes for free on an empty directory -- the second assertion
+greps the fixture's `CREATE TABLE` out of the raw file, so the case
+means "declines to read data that is demonstrably present".  Regenerate
+it by building `zskvbench` against the previous library's sources and
+running `--build-only`.  If upstream makes a version mismatch a hard
+error, these expectations flip and should be updated -- deliberately.
 
-`ext/zeroskip/VENDOR` records the upstream commit.  To re-vendor:
-copy `zeroskip.c`, `zeroskip.h`, `xxhash.h` from `../zeroskip2`, update
-VENDOR, rebuild, and run the full test list above.
+`ext/zeroskip/VENDOR` records the upstream commit.  To re-vendor: copy
+`zeroskip.c`, `zeroskip.h`, `xxhash.h`, `zsbench.c` from `../zeroskip2`,
+update VENDOR, rebuild, and run the full test list above.  **Read
+upstream's CHANGELOG for how they paired their own A/B arms before
+building yours**: 3.0.0's benchmark numbers are quoted against a
+purpose-built format-2 arm rather than against the previous release,
+because the release before it carried a benchmark bug, and repeating
+that pairing is what kept this vendoring's fetch comparison from
+reporting the sign backwards.
 
 The savepoint undo log borrows before-image value pointers under A-4's
 transaction-lifetime rule, including fetches of the transaction's own

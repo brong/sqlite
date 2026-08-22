@@ -1,5 +1,130 @@
-source: ffbb7e1
-date: 2026-08-19 (library 2.9.1, and 2.9.0/2.8.0/2.7.0/2.6.0 with it.
+source: 52a1e84
+date: 2026-08-21 (library 3.0.0 -- FORMAT 3, and 2.9.1/2.9.0/2.8.0/2.7.0/2.6.0
+      below it.
+
+      A FORMAT CHANGE IS A RE-VENDOR AND A RE-VERIFY, NOT A PORT -- and that
+      claim, which this engine's doc has made since the first vendoring, has
+      now been TESTED by a real one rather than merely asserted.  An in-order
+      file stopped storing records and started storing
+      [header][pointers][keys][values][trailer]: a dense array of key entries
+      pointing into an unframed values region.  Not one line of btree_zs.c
+      moved for the layout.  The engine never reads a file name, counts files
+      or knows the layout, and that is why.
+
+      ONE API CHANGE DID REACH US, and it was not the format.  ZS_NOCSUM is
+      GONE (A-18).  No record carries a checksum in format 3 (F-13a) and an
+      in-order file's regions are never verified on a read path (F-33a), so
+      the flag had nothing left to select; upstream REJECTS the bit rather
+      than ignoring it, on the ground that a caller passing it believes it is
+      weakening verification and is entitled to be told otherwise.  So our
+      `zs_nocsum=1` URI parameter is deleted rather than left as an inert
+      alias -- an inert alias would have been the one outcome upstream took
+      trouble to prevent.  Nothing in this tree set it.
+
+      WHAT THAT COSTS US, STATED PLAINLY: the read path now verifies NOTHING.
+      Region checksums are checked by zs_db_check_consistency and by a repack,
+      never by a read, so between consistency checks corrupt bytes in an
+      in-order file are returned to us and we hand them to the VDBE.  That is
+      upstream's deliberate trade (F-5e), but it is a REDUCTION in what this
+      engine offered over the stock btree, and the doc's old pitch -- a safety
+      net stock never had -- now has to say the net is cast at maintenance
+      time.  Crash safety is untouched: span and terminator checksums keep
+      their role in the active file, so a reopen after a crash still yields a
+      valid prefix, with or without zs_nosync.  `zs_csum=none` survives as the
+      one remaining URI opt-out (it selects engine 0 for files this handle
+      WRITES, which is a different lever).
+
+      A FORMAT-2 DATABASE READS AS EMPTY, and there is now a fixture that says
+      so.  Formats reject each other at the magic (F-6b, R-6) with no
+      migrator, which at this layer surfaces as an empty database rather than
+      an error -- format-guard.sh case 4b, built by running zskvbench against
+      the 2.9.1 sources, holds a 50-row `kv` table whose CREATE TABLE is still
+      legible in the file while the engine reports zero tables.  The second
+      assertion exists because the first passes for free on an empty
+      directory; both were mutation-checked, and each mutant kills exactly its
+      own check.  Nothing has shipped on format 2 so nothing needs carrying
+      forward, but any benchmark or test directory left over from before
+      2026-08-21 will read empty and the first write will start a fresh
+      generation beside data still on disk.
+
+      READS ARE UP, AND UPSTREAM'S NUMBERS REPRODUCE.  Raw zsbench, 500k
+      records, 4 passes per arm with the arm order alternated, paired against
+      6fe9862 -- format 2 carrying the benchmark fix but not the format, which
+      is upstream's own pairing and matters (see below):
+
+          fetch (6 files)             456-473k/s -> 526-548k/s   +11..20%
+          fetch (6 files, repacked)   418-441k/s -> 472-486k/s   +7..16%
+          full scan                   51.4-52.2M -> 69.0-75.6M   +32..47%
+          full scan, compacted        61.2-62.6M -> 90.9-91.7M   +45..50%
+          full scan, interleaved      39.1-42.0M -> 50.2-52.6M   +20..35%
+          full scan, shadowed         30.4-35.2M -> 43.0-44.9M   +22..48%
+
+      Upstream measures +14% on the repacked fetch and +37% on the compacted
+      scan; we land on or above both.  `full scan, no verify` is simply GONE
+      as a row -- there is no verification left for it to skip.  The one
+      disagreement is `full scan, shadowed`, which upstream reports DOWN 5.4%
+      with no mechanism attached and which is UP here; different host, and
+      neither of us can explain it, so it stays flagged rather than averaged.
+
+      BULK STORE IS DOWN 10-13% AND THE MECHANISM IS CLOSED.  2M records at
+      1000-per-txn, rowid, through SQL, 6 passes per arm, order alternated:
+      1726-1746k/s -> 1520-1560k/s.  The instrumented merge counters say why,
+      and they are far quieter than the wall clock -- identical BYTES, more
+      TIME:
+
+          conversions   117, 263MB, 123-127ms -> 117, 265MB, 170-176ms  +37%
+          repacks        40, 830MB, 393-427ms ->  39, 841MB, 497-532ms  +21%
+          merge total          516-554ms      ->       667-708ms       +150ms
+          the store row's own delta                                    +147ms
+
+      So the extra merge time IS the whole regression, with nothing left over.
+      Confirmed underneath us on upstream's own fixture, where the arms are
+      quieter still: raw `store, 1000 per txn` 2406-2438k/s -> 2193-2201k/s
+      (-9%), `store, all in one txn` 4353-4451k -> 4200-4236k (-3..-5%).
+
+      Upstream priced the CONVERSION half of this and called it not worth
+      chasing -- one 20MB conversion going 10.3ms -> 12.5ms, "about 2% of a
+      bulk load that seals", against +19% on a scan.  Two things that figure
+      misses at our scale, and they are the report to send back: the REPACK
+      path pays the same builder cost (+21%, which upstream did not measure),
+      and in a cascading bulk load repacks are ~3x the conversion bytes, so
+      the weighted cost is 150ms and not 2ms.  The cause upstream names is the
+      builder's 32-byte descriptor per record and its second pass, where
+      format 2 encoded into one buffer in a single pass.
+
+      Write amplification otherwise IMPROVES: at 200k, WITHOUT ROWID 6.7x ->
+      5.6x of stored at 100-per-txn and 6.9x -> 5.8x at 1000, rowid 1000/txn
+      2.7x -> 2.3x.  One row goes the other way -- rowid at 100-per-txn, 2.7x
+      -> 3.5x -- and it is a cascade BOUNDARY effect, not a per-record cost:
+      the same data at 1000-per-txn repacks 3 times for 27MB instead of 4 for
+      36MB.  Deterministic per arm across every pass, both directions.
+
+      THIS LAPTOP RESOLVES NOTHING AT 500k THROUGH SQL, and that is worth
+      recording as an instrument fact.  Eight passes per arm on the full
+      sweep: every row overlaps, including the store row that had
+      non-overlapping ranges at three passes.  The 2M result above stands
+      because merge work is a large enough share of that run to clear the
+      noise; the same question at 500k is unanswerable here.  Read the raw
+      rows and the instrumented counters, not the SQL wall clock.
+
+      OUR OWN BENCHMARK CARRIED UPSTREAM'S OVERFLOW BUG.  test/zskvbench.c had
+      the identical `(i * 7919) % nrecs` int multiplication that upstream
+      fixed in 6fe9862: above n = 271181 roughly half the products wrap and
+      the row times a hit/miss MIXTURE under a label claiming the hit path,
+      with the miss half the cheaper one.  Fixed here the same way.  It never
+      corrupted a published number -- every fetch figure in doc/ is at 20k or
+      200k, and prodrun.sh's large-n phases all pass --only, which runs no
+      fetch -- but the first `-n 500000` run would have.  It also nearly cost
+      this vendoring a wrong conclusion: the first raw fetch A/B, run against
+      ffbb7e1 rather than 6fe9862, showed format 3 LOSING, because the format-2
+      arm was answering 271183 lookups where format 3 answered 500000.
+
+      Test tier, all green on 3.0.0: zskey-test, zsbtree-test, the 10 SQL
+      batteries, format-guard (now 8 cases), crash-test 10 rounds, busy-test,
+      backup-concurrent, 966/966 files through the TCL permutation, plus
+      twowriter 6/6 and metacache 8/8.
+
+      Also 2.9.1, and 2.9.0/2.8.0/2.7.0/2.6.0 with it.
 
       THE LOCK PROTOCOL CHANGED and nothing here had to move, but two of our
       own comments were wrong afterwards.
