@@ -11,6 +11,21 @@
  *   cc -O2 -Iext/zeroskip -DHINTS_OFF=1 -o m10 xxhmatrix.c
  *   cc -O2 -Iext/zeroskip -DXXH3_STREAM_USE_STACK=1 -o m01 xxhmatrix.c
  *   cc -O2 -Iext/zeroskip -DHINTS_OFF=1 -DXXH3_STREAM_USE_STACK=1 -o m11 ...
+ *
+ * Across toolchains, which is how the conclusion was reached -- the answer is
+ * NOT the same on gcc 12 as on gcc 14, so one compiler is not a survey:
+ *
+ *   docker run --rm -v $PWD/ext/zeroskip:/z:ro -v $PWD/test/zs:/t:ro \
+ *     debian:trixie-slim sh -c 'apt-get -qq update >/dev/null &&
+ *       apt-get -qq install -y gcc clang >/dev/null && cp /z/xxhash.h /t/xxhmatrix.c /tmp
+ *       && cd /tmp && for cc in gcc clang; do for f in "" -DHINTS_OFF=1 \
+ *       -DXXH3_STREAM_USE_STACK=1 "-DHINTS_OFF=1 -DXXH3_STREAM_USE_STACK=1"; do
+ *       $cc -O2 -I. $f -o m xxhmatrix.c && ./m | tail -1; done; done'
+ *
+ * Time it on the HOST arch only: a container under emulation cannot time vector
+ * code, and even native the Docker VM gave a 2.2x spread on one arm at the
+ * library level.  This file's loop is tight enough to be stable; a store
+ * benchmark inside a container is not.
  */
 #define XXH_INLINE_ALL
 #ifdef HINTS_OFF

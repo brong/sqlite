@@ -1769,14 +1769,53 @@ arm's range (538-561ms at 619MB) **and** inside format 2's merge total
 the one-shot rows are unaffected, as the matrix predicts, so nothing is
 traded for it.
 
-**Not adopted, and it may not be ours to have.** The change is two lines
-in a vendored file, so it goes upstream rather than into our copy.  And
-production is **x86-64** (AMD EPYC 7402P), which is exactly where
-`XXH_NO_INLINE_HINTS` has its stated justification -- this was measured
-on ARM64, where that justification does not apply.  Whether the hint can
-be lifted on x86, or whether xxhash's clang exclusion should simply be
-narrowed, is upstream's call and needs re-measuring on the EPYC before
-anyone claims the win there.
+**Not adopted: it is two lines in a vendored file, so it goes upstream.**
+
+##### The hint flag across toolchains, and why NOT to fork xxhash
+
+Docker, native aarch64 Linux, `test/zs/xxhmatrix.c`, GB/s as
+one-shot/streamed.  "hints" is what `zeroskip.c` sets today:
+
+| toolchain | plain | hints | **stack** | hints+stack |
+|---|---|---|---|---|
+| gcc 12 | 15.4 / 16.0 | **18.9 / 19.0** | 15.3 / 16.0 | 17.3 / 17.9 |
+| gcc 14 | 59.0 / 59.0 | 19.4 / 19.3 | **59.2 / 57.7** | 19.4 / 19.4 |
+| clang 14 | 60.4 / 20.3 | 58.6 / 20.4 | **60.3 / 62.3** | 57.4 / 18.4 |
+| clang 19 | 62.5 / 20.3 | 24.3 / 10.8 | **61.0 / 63.2** | 16.5 / 8.9 |
+| Apple clang 21 | 51.9 / 20.7 | 52.3 / 21.1 | **48.3 / 49.8** | 52.1 / 21.2 |
+
+`XXH_NO_INLINE_HINTS` is not merely blocking the streaming fix -- on a
+modern toolchain it costs **3x on BOTH paths**: gcc 14 goes 59.0 -> 19.4
+GB/s, clang 19 62.5 -> 24.3.  That reaches every checksum the library
+takes, span terminators on every commit included, not just merges.
+`stack` with the hint dropped is the best or tied-best column in every
+row except gcc 12 -- and gcc 12 is slow in absolute terms everywhere
+(18.9 against gcc 14's 59.0), so that is a bad-compiler case rather than
+a reason to keep the flag.
+
+**Portability checked, not assumed:** `zeroskip.c` with the hint dropped
+compiles clean under gcc 12, gcc 14, clang 14, clang 19 and Apple clang
+21, on both x86-64 and aarch64.  The flag's stated reason -- an
+`always_inline`/SSE2 failure -- did not reproduce on any of them.
+
+**So the answer to "can we pull the optimised hash into zeroskip.c" is:
+we do not need to, and should not.** The entire difference is two
+preprocessor lines -- delete one `#define`, add `#define
+XXH3_STREAM_USE_STACK 1` (xxhash withholds that from clang by its own
+guard).  Copying the accumulate loop in would fork the digest-critical
+core of xxhash, with its vector paths and secret handling, to reach a
+state the flags already reach exactly.  The relaxed licence makes it
+*allowed*, not *worth it*.
+
+**What this is worth is single-digit percent, not 3x.** Hashing is a
+modest share of real work: the engine A/B above moved merge time ~5%,
+and a raw-library store row does not separate at all.  Two things this
+laptop cannot answer -- **x86 performance** (production is an EPYC;
+Docker under emulation cannot time it, and the Docker VM could not
+resolve library timing even natively, giving a 2.2x spread on one arm) --
+and whether upstream would rather narrow xxhash's own clang exclusion
+than have every caller carry a local flag.  Both belong on the EPYC and
+with upstream.
 
 ##### What actually got slower, attributed (3.0.0, kept as the record)
 
