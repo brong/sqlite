@@ -1714,6 +1714,70 @@ where the memory is there and the cascade is the cost.  Re-take that
 decision on production, where the merge is slower in absolute terms and
 there is 993GB of RAM -- `prodrun` should sweep it.
 
+##### Inside xxhash: why streaming is 2.5x, and the flag pair that fixes it
+
+`test/zs/xxhmatrix.c`.  The one-shot long path keeps its eight
+accumulator lanes in a **local** `acc[8]`, so they live in vector
+registers for the whole loop.  The streaming path normally copies
+`state->acc` into a local array on entry and back on exit -- except
+`xxhash.h` disables that for clang:
+
+    #ifndef XXH3_STREAM_USE_STACK
+    # if XXH_SIZE_OPT <= 0 && !defined(__clang__)
+    #   define XXH3_STREAM_USE_STACK 1
+
+so under clang the accumulator stays a pointer into the heap-allocated
+state for the entire accumulate loop.  **It is not alignment** -- XXH3
+reads through `XXH_readLE64`, which compiles to unaligned loads that are
+free on ARM64 and x86-64, and the 21 GB/s figure is measured on a
+page-aligned buffer in a single `update` call.  Nor is it call
+granularity: 1, 2, 64KB and 1MB chunks all measure the same.
+
+But the fix is *conditional*, and the condition is why an engine A/B of
+`-DXXH3_STREAM_USE_STACK=1` measured nothing at all:
+
+| `XXH_NO_INLINE_HINTS` | `STREAM_USE_STACK` | one-shot | streamed | |
+|---|---|---:|---:|---:|
+| 0 | 0 | 51.9 GB/s | 20.7 GB/s | 0.40x |
+| 0 | **1** | 48.3 GB/s | 49.8 GB/s | **1.03x** |
+| **1** | 0 | 52.3 GB/s | 21.1 GB/s | 0.40x |
+| **1** | **1** | 52.1 GB/s | 21.2 GB/s | 0.41x |
+
+`zeroskip.c` defines `XXH_NO_INLINE_HINTS 1` before including xxhash --
+for a stated x86 reason, "callers without the SSE2 target attribute
+cannot inline always_inline SSE2 helpers" -- which turns
+`XXH_FORCE_INLINE` into a plain `static`.  `XXH3_accumulate` then takes
+`acc` as a real pointer argument, so the accumulator round-trips to
+memory per call whether it sits on the stack or in the state struct, and
+the stack copy buys nothing.  **The two flags only work together.**
+
+Lifting the hint on non-x86 *and* setting the stack flag, measured in the
+engine at 2M records, four passes per arm:
+
+| arm | store/s | merge ms | peak RSS |
+|---|---:|---:|---:|
+| stock, `mm=1B` (all streamed) | 1438-1655k | 616-673 | 315MB |
+| **patched, `mm=1B`** | **1683-1702k** | **563-586** | **315MB** |
+| stock, `mm=64MB` (default) | 1638-1695k | 570-598 | 318MB |
+| **patched, `mm=64MB`** | **1704-1723k** | **539-570** | **318MB** |
+| stock, `mm=1GB` (all held) | 1727-1762k | 538-561 | 619MB |
+| patched, `mm=1GB` | 1699-1760k | 526-572 | 619MB |
+
+The patched default arm (539-570ms at 318MB) lands inside the *held*
+arm's range (538-561ms at 619MB) **and** inside format 2's merge total
+(520-556ms).  That is the whole residual closed at half the memory --
+the one-shot rows are unaffected, as the matrix predicts, so nothing is
+traded for it.
+
+**Not adopted, and it may not be ours to have.** The change is two lines
+in a vendored file, so it goes upstream rather than into our copy.  And
+production is **x86-64** (AMD EPYC 7402P), which is exactly where
+`XXH_NO_INLINE_HINTS` has its stated justification -- this was measured
+on ARM64, where that justification does not apply.  Whether the hint can
+be lifted on x86, or whether xxhash's clang exclusion should simply be
+narrowed, is upstream's call and needs re-measuring on the EPYC before
+anyone claims the win there.
+
 ##### What actually got slower, attributed (3.0.0, kept as the record)
 
 A 12-second `sample` of the 2M load on each arm, comparing the writer
@@ -1739,7 +1803,9 @@ values in *separate* buffers -- deliberately, so the values can be
 written straight from where they were accumulated -- so `zsi_csum2` has
 to stream them (`XXH3_64bits_update` -> `XXH3_consumeStripes`).
 Measured directly on this laptop over 21MB split 1:10, same digest both
-ways: **one-shot 51.2 GB/s, streamed-over-two-buffers 20.9 GB/s**.
+ways: **one-shot 51.2 GB/s, streamed-over-two-buffers 20.9 GB/s**.  (Why,
+and the flag pair that closes it, is two sections below -- the mechanism
+is the accumulator leaving registers, not alignment.)
 That is the cost of the very optimisation that avoided a copy: skipping
 one memcpy of the values (~0.04 s/GB) bought a hash that costs ~0.028
 s/GB more.  Close to a wash by that arithmetic, and the profile says it

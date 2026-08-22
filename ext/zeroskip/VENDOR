@@ -7,7 +7,7 @@ date: 2026-08-22 (library 3.1.0, and 3.0.1 with it -- our two findings from
 
       BOTH FINDINGS CONFIRMED, WITH THE SAME NUMBERS.  Upstream measures XXH3's
       streaming state at 21 GB/s against 54 one-shot (we measured 21 against
-      51, test/zs/xxhcmp.c) and reproduces the part that mattered: FLAT across
+      51, test/zs/xxhmatrix.c) and reproduces the part that mattered: FLAT across
       1, 2, 64KB-chunked and 1MB-chunked update calls, so the penalty is the
       API and neither chunking nor re-ordering recovers any of it.  3.0.1 takes
       the abutted-buffer shape -- values accumulated behind a GAP, the head
@@ -73,6 +73,30 @@ date: 2026-08-22 (library 3.1.0, and 3.0.1 with it -- our two findings from
       the memory is available and the cascade is the cost.  That is a decision
       to re-take on production, where the merge is slower in absolute terms and
       the memory is 993GB -- prodrun should sweep it.
+
+      WHAT IS INSIDE XXHASH, since the streaming penalty is still live for any
+      region over merge_memory.  The one-shot keeps its eight accumulator lanes
+      in a LOCAL array and so in registers; the streaming path normally copies
+      state->acc to a local on entry and back on exit, but xxhash.h disables
+      that under clang (`!defined(__clang__)`), so the accumulator stays a heap
+      pointer for the whole loop.  NOT alignment -- XXH3 reads through
+      XXH_readLE64, whose unaligned loads are free on both our targets, and the
+      21 GB/s is measured on a page-aligned buffer in ONE update call.
+
+      -DXXH3_STREAM_USE_STACK=1 alone measures NOTHING in this engine, and the
+      reason is a second flag: zeroskip.c sets XXH_NO_INLINE_HINTS 1, which
+      turns XXH_FORCE_INLINE into plain static, so XXH3_accumulate takes acc as
+      a real pointer and the round trip happens wherever acc lives.  The two
+      flags only work TOGETHER (test/zs/xxhmatrix.c crosses them: 0.40x, 1.03x,
+      0.40x, 0.41x).  With both, at 2M records, the DEFAULT merge_memory arm
+      runs 539-570ms at 318MB -- inside the all-held arm's 538-561ms at 619MB,
+      and inside format 2's 520-556ms.  The residual closes at half the memory.
+
+      NOT ADOPTED.  It is two lines in a vendored file, so it goes upstream.
+      And production is x86-64, which is exactly where XXH_NO_INLINE_HINTS has
+      its stated SSE2 justification; this was measured on ARM64 where that
+      justification does not apply.  Nobody should claim this win on the EPYC
+      until it is measured there.
 
       A note on upstream's own tests worth carrying: five mutants had ROTTED at
       52a1e84 -- the version we vendored yesterday -- because a rename left them
