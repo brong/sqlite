@@ -1817,6 +1817,62 @@ and whether upstream would rather narrow xxhash's own clang exclusion
 than have every caller carry a local flag.  Both belong on the EPYC and
 with upstream.
 
+##### Outcome: upstream took it as 3.1.1, and the -Og reason was real
+
+Upstream released it the same day.  `zeroskip.c` no longer sets
+`XXH_NO_INLINE_HINTS` and now sets `XXH3_STREAM_USE_STACK 1` explicitly.
+Two corrections to the section above came out of doing it:
+
+**The flag's stated reason IS real, just misattributed** -- and the
+portability check above missed it because it only tried `-O2`.  It is not
+SSE2: gcc refuses xxhash's `always_inline` NEON helpers at `-Og`
+("function not considered for inlining") and hits an *internal compiler
+error* at `-O1` on aarch64.  clang is clean at every level.  So the flag
+lives on upstream's low-optimisation targets (`XXH_LOWOPT_DEF`, used by
+`asan` and `leaks`) and nowhere else; a hand-rolled `-Og` build now fails
+loudly rather than every shipped build silently paying 3x.  Nothing in
+this tree builds `zeroskip.c` below `-O2`: it is not in the amalgamation,
+our only `-O1` is `jimsh`, and xxhash self-protects at `-O0` via
+`__NO_INLINE__`.
+
+**End to end it is ~8%, and that is a LINUX number.** Upstream's own
+fixture on Debian trixie, best of nine: gcc 1107k -> 1202k/s, clang 1122k
+-> 1205k/s.  On this laptop the engine barely moves, because Apple clang
+shows no one-shot penalty at all -- only the streaming half is recovered.
+Quoting the 8% from a macOS run would understate it; the EPYC is where it
+should land.
+
+The `merge_memory` trade is largely retired.  Shipped code, 2M records,
+four passes per arm, order alternated:
+
+| | 3.1.0 | 3.1.1 | peak RSS |
+|---|---:|---:|---:|
+| default, merge ms | 559-581 | **541-567** | 318MB |
+| `mm=1GB`, merge ms | 547-558 | 517-548 | 619MB |
+
+3.1.1's default now overlaps what 3.1.0 needed 619MB to reach, and
+overlaps format 2's 520-556 -- format-2 merge speed at 318MB.  Holding
+still edges it, but at twice the memory with overlapping ranges, so the
+default stands and `zs_merge_memory` remains what 3.1.0 added it for:
+bounding a compaction.
+
+##### twom was checked and needs nothing
+
+It vendors xxhash too and sets the same flag, for a different stated
+reason (`-Og`).  It is unaffected either way: it only hashes record
+*headers* of a few dozen bytes (`file->csum(base, OFFSET_CSUM)`), which
+take XXH3's short-input path rather than the vectorized accumulate loop
+the flag pessimises.  Measured both ways -- **304 M hashes/s at 24 and 64
+bytes, identical to three digits on gcc and clang, identical digests** --
+and `fillseq`/`fillrandom`/`overwrite`/`repack`/`readrandom` are flat in
+both directions on both compilers.  It does not need the flag for its own
+`-Og` build either, since it never instantiates the streaming helpers that
+fail to inline.  Left alone.
+
+*The generalisation to resist is "same flag, same bug".  What decides it
+is the SIZE of the inputs being hashed: zeroskip hashes whole regions
+through the vectorized loop, twom hashes headers through the short path.*
+
 ##### What actually got slower, attributed (3.0.0, kept as the record)
 
 A 12-second `sample` of the 2M load on each arm, comparing the writer
