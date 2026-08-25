@@ -39,7 +39,7 @@ NMID=${NMID:-200000}
 IDXDIR=${IDXDIR:-/tmpfs/zsidx}
 # PHASES lets a phase be re-run on its own -- phase 3 in particular, which
 # needs privilege and so wants an interactive shell for sudo.
-PHASES=${PHASES:-matrix cascade cached opens latency syscalls fsync}
+PHASES=${PHASES:-matrix cascade mergemem cached opens latency syscalls fsync}
 has_phase(){ case " $PHASES " in *" $1 "*) return 0;; *) return 1;; esac; }
 
 [ $# -ge 1 ] || { echo "usage: $0 DATASET_MOUNTPOINT [MORE...]" >&2; exit 2; }
@@ -215,6 +215,68 @@ for d in "$@"; do
   done
 done > "$OUT/cascade.txt" 2>&1
 grep -E "^--|per txn|rewritten|deferred" "$OUT/cascade.txt" | sed 's/^/  /'
+fi
+
+# ------------------------------------------------------------------ mergemem
+if has_phase mergemem; then
+say "phase: merge_memory -- what the A-20 ceiling costs and buys"
+# WHY: library 3.1.0 made a merge hold a 32-byte REFERENCE per record instead
+# of the output bytes, bounded by merge_memory (A-20, default 64MB).  A region
+# that fits is HELD and checksummed in one call; a larger one STREAMS through a
+# 256KB window.  That matters to us twice over: zs_db_compact runs from VACUUM
+# and from a backup finish, and its output is O(DATABASE), so the ceiling is
+# what makes compacting a database bigger than memory possible at all.
+#
+# The question this phase settles is whether the DEFAULT is right.  Upstream's
+# justification for 64MB was that holding lets a region be checksummed in one
+# call -- and 3.1.1 removed the streaming checksum's penalty entirely (XXH3's
+# streaming path was 2.5x slower only because XXH3_STREAM_USE_STACK was unset
+# under clang), so that justification is now void.  What holding still buys is
+# one write(2) instead of a few dozen, against up to merge_memory of RSS per
+# merge.  Upstream's "streaming everything costs ~6% of a bulk load" was
+# measured BEFORE that fix and wants redoing; the default may want to go much
+# lower, possibly to always-stream, which would cut peak RSS for free.
+#
+# On the laptop at 2M records the three settings came out 315MB/318MB/619MB of
+# peak RSS for 591-627 / 561-629 / 529-556 ms of merge on 3.1.0.  APFS cannot
+# decide it: the second walk streaming needs re-reads its input, and whether
+# that costs is a ZFS/ARC question.
+#
+# RSS is half the answer, so capture it rather than timing alone.  GNU time
+# reports it; if it is absent the rows still carry the library's own merge
+# counters, which is what the timing argument turns on.
+TIMEV=""
+command -v /usr/bin/time >/dev/null 2>&1 && /usr/bin/time -v true >/dev/null 2>&1 \
+    && TIMEV="/usr/bin/time -v"
+[ -n "$TIMEV" ] || echo "note: GNU time -v unavailable; peak RSS not captured"
+for d in "$@"; do
+  for n in "$NMID" "$NBIG"; do
+    # 1 byte = nothing ever fits, so every region streams.  A ceiling nothing
+    # reaches holds every region.  Empty = the library default.  Interleaved
+    # rather than run in a block, and the order rotates, because a fixed order
+    # has manufactured a clean-looking few-percent result before.
+    for pass in 1 2 3; do
+      case $pass in
+        1) order="1 '' 1073741824" ;;
+        2) order="1073741824 1 ''" ;;
+        3) order="'' 1073741824 1" ;;
+      esac
+      for mm in $order; do
+        mm=$(eval echo "$mm")
+        w="$d/mm"; rm -rf "$w"; mkdir -p "$w"
+        echo "-- $d n=$n pass=$pass merge_memory=${mm:-<default 64MB>}"
+        if [ -n "$mm" ]; then
+          $TIMEV ./zskvbench --dir "$w" -n "$n" --reps 1 --rowid --only 1000 \
+            --uri "zs_merge_memory=$mm" 2>&1 | grep -vE "^\s*(Command being|User time|System time|Percent of|Elapsed|Average|Voluntary|Involuntary|Swaps|File system|Socket|Signals|Page size|Exit status|Minor|Major)" 
+        else
+          $TIMEV ./zskvbench --dir "$w" -n "$n" --reps 1 --rowid --only 1000 \
+            2>&1 | grep -vE "^\s*(Command being|User time|System time|Percent of|Elapsed|Average|Voluntary|Involuntary|Swaps|File system|Socket|Signals|Page size|Exit status|Minor|Major)"
+        fi
+        rm -rf "$w"
+      done
+    done
+  done
+done | tee "$OUT/mergemem.txt"
 fi
 
 # --------------------------------------------------------------------- cached

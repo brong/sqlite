@@ -1714,7 +1714,12 @@ where the memory is there and the cascade is the cost.  Re-take that
 decision on production, where the merge is slower in absolute terms and
 there is 993GB of RAM -- `prodrun` should sweep it.
 
-##### Inside xxhash: why streaming is 2.5x, and the flag pair that fixes it
+##### Inside xxhash: why streaming WAS 2.5x, and the flag pair that fixed it
+
+> **Fixed at 3.1.1 -- everything below is the diagnosis, not current
+> behaviour.** Streaming and one-shot are at parity now, so any claim
+> anywhere that streaming costs 2.5x is void at HEAD.
+
 
 `test/zs/xxhmatrix.c`.  The one-shot long path keeps its eight
 accumulator lanes in a **local** `acc[8]`, so they live in vector
@@ -1842,19 +1847,35 @@ shows no one-shot penalty at all -- only the streaming half is recovered.
 Quoting the 8% from a macOS run would understate it; the EPYC is where it
 should land.
 
-The `merge_memory` trade is largely retired.  Shipped code, 2M records,
-four passes per arm, order alternated:
+**The format-2 residual is closed, and this time it is one run.** The
+earlier version of this claim compared 3.1.1 against a format-2 range
+from a *different* run, which is exactly the cross-run comparison this
+document warns about elsewhere.  Redone with all four arms interleaved,
+2M records, five passes each, arm order rotated every pass:
 
-| | 3.1.0 | 3.1.1 | peak RSS |
-|---|---:|---:|---:|
-| default, merge ms | 559-581 | **541-567** | 318MB |
-| `mm=1GB`, merge ms | 547-558 | 517-548 | 619MB |
+| | fmt2 (2.9.1) | 3.1.1 `mm=1B` | 3.1.1 default | 3.1.1 `mm=1GB` |
+|---|---:|---:|---:|---:|
+| store/s | 1649-1707k | 1661-1720k | 1639-1732k | **1738-1780k** |
+| merge ms | 548-592 | 558-604 | 554-598 | **526-548** |
+| merge MB | 1093 | 1106 | 1106 | 1106 |
+| peak RSS | 484MB | **315MB** | 318MB | 619MB |
 
-3.1.1's default now overlaps what 3.1.0 needed 619MB to reach, and
-overlaps format 2's 520-556 -- format-2 merge speed at 318MB.  Holding
-still edges it, but at twice the memory with overlapping ranges, so the
-default stands and `zs_merge_memory` remains what 3.1.0 added it for:
-bounding a compaction.
+3.1.1's default **overlaps format 2** on merge time while using 34% less
+memory -- the residual format 3 carried since it landed is gone.
+
+**And always-stream is indistinguishable from the default here**
+(558-604 against 554-598, overlapping), for 315MB against 318MB.  That is
+the answer to upstream's question about lowering A-20's default at our
+shape: the 64MB ceiling buys ~3MB of RSS and no speed, because our merge
+*bytes* are concentrated in the few cascade merges that exceed it anyway.
+The real choice is default-versus-hold: holding everything is the only
+arm that separates (526-548ms, ~6% of merge) and it costs +300MB.
+
+**APFS cannot settle it.** The argument for holding is that streaming
+walks its input a second time and may re-fault it from disk -- precisely
+when the merge is big enough for the memory to matter.  That is an
+ARC/ZFS question, which is why `prodrun.sh` now carries a `mergemem`
+phase.
 
 ##### twom was checked and needs nothing
 
@@ -1891,7 +1912,8 @@ Two of those are worth reporting upstream, because neither is inherent
 to key/value separation:
 
 **1. The trailer checksum moved from XXH3's one-shot path to its
-streaming path, and that costs 2.4x on the same bytes.** Format 2's
+streaming path, and that cost 2.4x on the same bytes** (fixed at 3.1.1;
+the two paths are at parity now).** Format 2's
 records region was one contiguous buffer, so it hashed with
 `XXH3_64bits` (`XXH3_hashLong_64b_internal`).  Format 3 keeps keys and
 values in *separate* buffers -- deliberately, so the values can be
