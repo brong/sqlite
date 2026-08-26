@@ -1979,6 +1979,36 @@ which the duplication maximises.  Not measured.
 WITHOUT ROWID (10.8x of stored against 11.5x at 400B/2M, 7.7x against 9.2x
 at 400B/200k) where it rewrote MORE on rowid tables.
 
+##### Compaction does NOT defuse it: the cost is per lookup, not per file
+
+The discriminator, `VACUUM=1`, 2M rowid records at 4K, five passes per arm,
+file count 2 in both arms so the compaction demonstrably happened:
+
+| | uncompacted (6 files) | compacted (1 data file) |
+|---|---|---|
+| fmt2 fetch | 171412-173188 | 228135-233378 |
+| fmt3 fetch | 157408-160638 | 210454-214354 |
+| **fmt3 against fmt2** | **-6..-9%** | **-6..-10%** |
+
+**Unchanged.** Collapsing six files into one leaves the format gap exactly
+where it was, so format 3's fetch cost is paid once per LOOKUP and not once
+per matched file.  It is inherent to the split, and there is nothing a
+downstream caller can do about it -- "compact your read-mostly databases"
+does not buy it back.
+
+**What compaction IS worth, separately: +33% on point fetch, for BOTH
+formats** (171k -> 230k and 157k -> 213k, the same ratio to the digit).
+That is D-14d measured end to end at six files against one, and it is a
+larger effect than the entire format question.  It is also the strongest
+argument yet for making compaction routine rather than occasional: a
+read-mostly database left uncompacted is giving up a third of its lookup
+throughput regardless of which format it is in.
+
+The cost of getting it: `VACUUM` takes 15-17s on this 2M-record database
+and peaks at 1.2-1.4GB of RSS -- mostly the source files' mapped pages,
+since a compaction reads everything.  That is the O(database) behaviour
+`merge_memory` exists to bound, and the bound does not cover mapped inputs.
+
 ##### A hypothesis about the fetch deficit, offered and not measured
 
 A format-3 fetch touches two regions at different offsets -- the key entry,
