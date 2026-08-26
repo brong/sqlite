@@ -771,7 +771,7 @@ int main(int argc, char **argv){
     }else{
       fprintf(stderr, "usage: zskvbench [--dir PATH] [-n N] [--value N]"
                       " [--reps N] [--init SQL] [--uri PARAMS] [--vacuum]"
-                      " [--rowid] [--random] [--only N] [--defer-repack]"
+                      " [--rowid] [--random] [--only N|reads] [--defer-repack]"
                       " [--opens N] [--build-uri PARAMS] [--opens-per N]"
                       " [--latency N] [--seal-every N]"
                       " [--build-only] [--catchup-only]\n");
@@ -811,6 +811,16 @@ int main(int argc, char **argv){
     bench_latency(nLatency);
   }else if( nOpens>0 ){
     bench_opens(nOpens);
+  }else if( zOnly && strcmp(zOnly, "reads")==0 ){
+    /* --only reads: the fetch and scan rows WITHOUT the store sweep in front
+    ** of them.  Format 3's read case is a working-set argument, so it only
+    ** shows at a size where the database stops being cache-resident -- and at
+    ** that size the full sweep is unaffordable, because its 1-per-txn row is
+    ** N durable commits (2 million of them at 10k/s is over three minutes per
+    ** rep).  The 20k matrix therefore cannot test the claim format 3 rests on,
+    ** which is why this row exists.  bench_fetch_and_scan builds its own
+    ** database at 1000 per transaction first, so this is self-contained. */
+    bench_fetch_and_scan();
   }else if( zOnly ){
     bench_store(atoi(zOnly));
   }else{

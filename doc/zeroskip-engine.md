@@ -1877,6 +1877,75 @@ when the merge is big enough for the memory to matter, and that is an
 ARC question.  So `prodrun.sh` carries a `mergemem` phase, and it has now
 run.
 
+##### Production on 3.1.1 (2026-08-22, stl-imap-09): what moved and what did not
+
+`/tmp/zsprod-311`, commit 2fc7ca616c, vendored f365bc4, both recordsizes
+read back from `zfs get`.
+
+**The headline ratios hold.** Within this run, 20k records, rowid:
+durable 1-per-txn is **5.02x** stock at 4K (10266 vs 2043) and 4.38x at
+128K; 1000-per-txn is 0.84x / 1.02x; point fetch 1.34x / 1.78x; full scan
+0.58x / 0.68x.  Nothing about format 3 or 3.1.1 disturbed the shape.
+
+**Do not compare these against the 2.7.0 matrix above.** The stock column
+is the control, and between the two runs it moved **-17%** on one row
+(128K point fetch, 159877 -> 133064) where the doc's own note says this
+box's spread is -4% to +5%.  Cross-run deltas at that size are not
+readable; the within-run ratios are.
+
+**rollover=64MB is the best single lever, and it is also the cheapest in
+memory.** 2M records at 1000-per-txn, total wall against the 4K default:
+
+| recordsize | setting | store/s | total | merge ms | peak RSS |
+|---|---|---:|---:|---:|---:|
+| 4K | default (2MB, armed) | 264615 | 7.56s | 4438 | 291MB |
+| 4K | deferred + catch-up | 508069 | 6.14s (**-19%**) | 3139 | 327MB |
+| 4K | rollover 16MB armed | 317075 | 6.31s (-17%) | 2712 | 279MB |
+| 4K | rollover 16MB deferred | 458638 | 5.50s (-27%) | 1941 | 341MB |
+| 4K | **rollover 64MB armed** | 390515 | **5.12s (-32%)** | 1411 | **256MB** |
+| 128K | default (2MB, armed) | 374290 | 5.34s | 2308 | 291MB |
+| 128K | **rollover 64MB armed** | 438622 | **4.56s (-15%)** | 765 | **257MB** |
+
+**128K + 64MB is 4.56s against the 4K default's 7.56s -- -40%.** That
+supersedes the earlier "best = 128K + 16MB + deferred": 64MB armed beats
+every deferred combination, needs no catch-up, uses the least memory of
+any arm, and leaves the file count bounded throughout rather than only
+after the window closes.  Deferral still helps at 4K (-19% alone) and is
+nearly free at 128K (-2%), so it is no longer worth its complexity.
+
+**`zs_norepack=1` is a throughput and latency LOSS on production**, and
+only a `max` win.  200k single-record commits at 4K:
+
+| | commits/s | p50 | p90 | p99 | p99.9 | max |
+|---|---:|---:|---:|---:|---:|---:|
+| cascade armed | 9764 | 0.096 | 0.112 | 0.140 | 0.914 | 120.8ms |
+| `zs_norepack=1` | 5372 | 0.159 | 0.305 | 0.370 | 0.940 | 29.9ms |
+| norepack + seal/500 | 2156 | 0.388 | 0.946 | 1.120 | 1.428 | 24.2ms |
+
+Disarming costs **45% of throughput** and 1.7x the median for a p99.9
+that does not move; what it buys is the maximum, 121ms -> 30ms.  The
+mechanism is the documented one (D-14d): with no repacks the file count
+grows and `zsbtWrite` probes every file before every insert.  Sealing on
+top is worse again, which is the third independent confirmation of that
+retraction.  If the tail matters more than the median, this is the trade;
+for a per-message writer it is not.
+
+**merge_memory, with the memory finally measured.** 2M at 4K: `mm=1B`
+**272MB**, default 290-291MB, `mm=1GB` **492MB** -- the ceiling bounds
+memory exactly as designed, at 1.8x between the extremes, while every
+merge timing still overlaps.  The `stream` recommendation stands and is
+now complete rather than half-measured.
+
+**What this run could NOT test.** Format 3's read case is a working-set
+argument, so it only appears once the database stops being cache-resident
+-- and the matrix is 20k records, which on a 993GB box is entirely
+resident.  The +14% fetch and +37% scan that justify format 3 have
+therefore *never been checked at scale on production*.  The full sweep
+cannot do it either: its 1-per-txn row is N durable commits, over three
+minutes per rep at 2M.  `zskvbench --only reads` now runs the fetch and
+scan rows alone, building at 1000-per-txn first, which is what that
+question needs.
+
 ##### merge_memory on ZFS: the knob does nothing, so take the memory
 
 stl-imap-09, library 3.1.1, three passes per setting with the order
