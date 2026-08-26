@@ -1877,6 +1877,70 @@ when the merge is big enough for the memory to matter, and that is an
 ARC question.  So `prodrun.sh` carries a `mergemem` phase, and it has now
 run.
 
+##### Format 2 against format 3 on production: the fetch claim does not hold
+
+`test/zs/fmt2ab.sh`, stl-imap-09, five passes per arm with the order
+alternated, both recordsizes, rowid, guarded on the magic digit each arm
+wrote.  The sweep exists because format 3's case is a value:key ratio
+argument, so one value size cannot test it.
+
+**Scan is a clear win and it scales exactly as the mechanism predicts:**
+
+| value | scan, fmt3 against fmt2 |
+|---:|---|
+| 100B | +1..17% |
+| 200B | +8..21% |
+| 400B | **+26..41%** |
+
+Monotonic in value size, both recordsizes, both record counts.  Upstream's
++37% on a compacted scan is consistent with the 400B rows.  Nothing here
+disputes the scan case.
+
+**Fetch inverts with SIZE, which is the opposite of the claimed
+mechanism.** Taking only the cells where both arms ended with the same
+file count, so D-14d is not in the way:
+
+| | fetch, fmt3 against fmt2 |
+|---|---|
+| 200k, 200B | **+3..6%** |
+| 200k, 400B | **+1..4%** |
+| 2M, 100B | **-7..-9%** (4K), **-7..-11%** (128K) |
+
+Upstream measures +14% at 500k and +18% at 2M and reads the growth as "the
+mechanism reporting itself".  Here the advantage is +1..6% at 200k and
+**-7..-11% at 2M**: it shrinks and then inverts as the database grows.
+
+**The confounded cells make the case stronger, not weaker.** At 2M with
+200B and 400B values the two arms end with different file counts -- and
+format 3 ends with FEWER (5 against 7), which by D-14d should make its
+lookups cheaper.  It is slower anyway:
+
+    2M, 200B   files 7 -> 5   fetch -4..-7% (4K), -3..-5% (128K)
+    2M, 400B   files 7 -> 5   fetch overlap (4K), -2..-5% (128K)
+
+So in those cells the measured deficit is a LOWER bound on the layout's
+cost: format 3 is behind despite a file-count advantage.  The only cells
+biased the other way are 200k at 100B, where format 3 carries an extra
+file, and there its -1..-5% is an upper bound.
+
+**A hypothesis, offered and not measured.** A format-3 fetch touches two
+regions at different offsets -- the key entry, then the value it points at
+-- where format 2 touched one record.  At small sizes those land close
+enough to share page and TLB coverage; as the file grows they are
+megabytes apart, so the indirection costs a second miss that the denser
+search no longer pays for.  That would explain a win that shrinks with
+size, which is precisely the axis upstream expects it to grow along.  It
+predicts the deficit tracks file SIZE rather than record count, which is
+testable by holding records constant and varying the value size -- our 2M
+rows do vary it, and the deficit does narrow as values fatten (-7..-11% at
+100B, -3..-7% at 200B, -2..-5%/overlap at 400B), which is consistent.
+
+**Two things that are not the headline but should be recorded.** Format 3
+uses consistently LESS memory -- 880MB against 1019MB at 400B/2M, 520
+against 563 at 200B/2M -- which is 3.1.0's reference-holding rather than
+the format.  And it rewrites MORE at large values: 5.7x of stored against
+5.3x at 400B/2M, though less at 100B/200k (2.3x against 2.7x).
+
 ##### Reads at scale on production: the recordsize lever COMPOUNDS
 
 The matrix only ever went to 20k records, which on a 993GB box is
