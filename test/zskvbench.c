@@ -22,6 +22,7 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
+#include <dirent.h>          /* db_file_count: D-14d's governing variable */
 
 /* Sanitizers cost 3-4x and say nothing about themselves at runtime. */
 #if defined(__has_feature)
@@ -282,6 +283,27 @@ static double peak_rss_mb(void){
 #else
   return (double)ru.ru_maxrss / 1024.0;
 #endif
+}
+
+/* How many files the database directory holds.
+**
+** D-14d makes a point lookup linear in the file count, so a fetch comparison
+** between two library versions is only about the LAYOUT if both arms ended up
+** with the same number of files.  The first format-2/format-3 read run had no
+** way to tell those apart -- it reported rates and nothing about the shape that
+** produces them -- which is the same gap that let a merge_memory sweep come
+** back with no memory in it.  Report the count next to the rate. */
+static int db_file_count(const char *zDir){
+  DIR *d = opendir(zDir);
+  struct dirent *e;
+  int n = 0;
+  if( d==0 ) return -1;
+  while( (e = readdir(d))!=0 ){
+    if( e->d_name[0]=='.' ) continue;
+    n++;
+  }
+  closedir(d);
+  return n;
 }
 
 static void print_rewrites(const sqlite3_uint64 *a, double stored){
@@ -600,6 +622,16 @@ static void bench_fetch_and_scan(void){
       exit(1);
     }
     printf("  %-34s%8s  %5.2fs\n", "vacuum", "-", now()-t0);
+  }
+
+  /* The shape the rates come out of, printed BEFORE them: a fetch difference
+  ** between two libraries means the layout only if the file count matches. */
+  {
+    sqlite3_uint64 aSt[8];
+    printf("  %-34s%d\n", "files in the database", db_file_count(dir));
+    if( grab_rewrites(db, aSt) ){
+      print_rewrites(aSt, (double)nrecs * (double)(11 + valsize));
+    }
   }
 
   printf("  %-34s", "fetch");
