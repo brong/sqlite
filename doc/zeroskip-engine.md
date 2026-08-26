@@ -1924,11 +1924,31 @@ holding the entire 2MB database; at 22MB and up it starts missing, and the
 proportional to the file count and 2M records make more files.  Stock
 degrades 12% at 4K and is flat at 128K -- flat, but at half our rate.
 
-**Still untested: format 3 against format 2 on production.** Everything
-above is zeroskip-against-stock, which is a different question.  The
-+14%/+37% that justify the format are laptop and upstream numbers; testing
-them here needs a second library arm built on the box, the way the
-four-arm sweep was done locally.
+**Format 3 against format 2 on production: `test/zs/fmt2ab.sh`.**
+Everything above is zeroskip-against-stock, which is a different question
+-- the +14%/+37% that justify the format are laptop and upstream numbers.
+The script builds the format-2 arm out of THIS repository's history
+(`e2bba7b2e8`, which vendored 2.9.1), so a production box needs no sibling
+checkout: upstream's `zeroskip.c`/`.h` are byte-identical from `ffbb7e1`
+through `85ba990`, and format 3's implementation does not land until
+`8dc8893` -- `f19c7dd` is the *spec* commit and still has `keys_len` = 0,
+so "the commit before format 3" is a wider window than its subject line
+suggests.  Both arms use the CURRENT `zskvbench.c`, because the one that
+shipped alongside format 2 still had the `(i * 7919)` overflow that
+mis-times `fetch` above 271181 records -- exactly the range being measured.
+
+**The guard is on the on-disk artifact, not the binary.** Two arms that
+differ only in their executables would satisfy a `cmp` and could still
+write the same format: a null instrument that reads as a clean result.  So
+each arm writes a database and the magic's version digit is read back from
+an *in-order* file -- `zeroskip1` against `zeroskip2` -- and the run stops
+if they match.  Mutation-checked by pointing the format-2 arm at a commit
+that also writes format 3: different binaries, same digit, guard fires.
+(`zstool dump` would show the same thing more richly, but `zstool` is not
+vendored here, and its `--hex` is the conformance runner's key/value I/O
+mode rather than a header dump.)  The guard reads an in-order file
+specifically because `bench_store` deletes its database on the way out;
+`--build-only` is what leaves one behind.
 
 ##### Production on 3.1.1 (2026-08-22, stl-imap-09): what moved and what did not
 
