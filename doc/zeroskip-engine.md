@@ -1935,11 +1935,21 @@ testable by holding records constant and varying the value size -- our 2M
 rows do vary it, and the deficit does narrow as values fatten (-7..-11% at
 100B, -3..-7% at 200B, -2..-5%/overlap at 400B), which is consistent.
 
-**Two things that are not the headline but should be recorded.** Format 3
-uses consistently LESS memory -- 880MB against 1019MB at 400B/2M, 520
-against 563 at 200B/2M -- which is 3.1.0's reference-holding rather than
-the format.  And it rewrites MORE at large values: 5.7x of stored against
-5.3x at 400B/2M, though less at 100B/200k (2.3x against 2.7x).
+**The memory column is NOT evidence for either format.** Format 3 uses
+consistently less -- 880MB against 1019MB at 400B/2M, 520 against 563 at
+200B/2M -- but that is 3.1.0's reference-holding, and **nothing in
+reference-holding depends on key/value separation**.  A merge holds a
+32-byte reference per record into its inputs' mappings instead of the
+output bytes; a format-2 merge could do the same, and arguably more easily,
+since a format-2 record is one contiguous run in the source that can be
+copied straight out.  So the arms differ here by VERSION, not by format,
+and until someone tries it on format 2 this row belongs in neither column.
+The same caution applies in reverse to anyone reading these tables as a
+case for format 3 overall.
+
+**Format 3 rewrites MORE at large values**, which is a format difference:
+5.7x of stored against 5.3x at 400B/2M and 5.4x against 5.1x at 200B/2M,
+though less at 100B/200k (2.3x against 2.7x).
 
 ##### Reads at scale on production: the recordsize lever COMPOUNDS
 
