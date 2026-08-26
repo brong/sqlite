@@ -2230,6 +2230,15 @@ zskvbench$(T.exe):	$(TOP)/test/zskvbench.c $(libsqlite3.LIB)
 # zskvbench these give the three-way comparison driven by
 # test/zs/kvbench-all.sh.
 #
+# The STOCK arm must never see -DSQLITE_ZEROSKIP.  btree.c is wrapped in
+# `#ifndef SQLITE_ZEROSKIP` over its ENTIRE body, so compiling the amalgamation
+# with the flag deletes every btree definition and the link fails with a page of
+# "used but never defined".  kvbench-all.sh and prodrun.sh dodge this by running
+# `make zskvbenchstock` as a SEPARATE invocation carrying no OPTIONS -- which
+# works, and silently makes the target unusable in any command that does pass
+# OPTIONS, including the obvious one-liner.  Strip it here instead, so the
+# target is correct however it is invoked.
+zskvbenchstock$(T.exe): OPT_FEATURE_FLAGS := $(filter-out -DSQLITE_ZEROSKIP,$(OPT_FEATURE_FLAGS))
 zskvbenchstock$(T.exe):	$(TOP)/test/zskvbench.c sqlite3.c
 	$(T.link) -o $@ -I. \
 		$(TOP)/test/zskvbench.c sqlite3.c $(LDFLAGS.libsqlite3)
