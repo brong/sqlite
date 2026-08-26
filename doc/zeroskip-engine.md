@@ -1877,6 +1877,59 @@ when the merge is big enough for the memory to matter, and that is an
 ARC question.  So `prodrun.sh` carries a `mergemem` phase, and it has now
 run.
 
+##### Reads at scale on production: the recordsize lever COMPOUNDS
+
+The matrix only ever went to 20k records, which on a 993GB box is
+entirely cache-resident, so the read rows were measuring caches.
+`zskvbench --only reads` at 200k and 2M, best of 3, stl-imap-09, 3.1.1:
+
+| recordsize | n | fetch zs | stock | ratio | scan zs | stock | ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 4K | 200k | 206482 | 149897 | 1.38x | 6.25M | 6.29M | 0.99x |
+| 4K | 2M | 167543 | 131664 | 1.27x | 6.43M | 6.96M | 0.92x |
+| 128K | 200k | 208175 | 85191 | **2.44x** | 6.70M | 6.03M | 1.11x |
+| 128K | 2M | 167687 | 84882 | **1.98x** | 6.75M | 6.22M | 1.09x |
+
+**recordsize=128K costs stock 36-43% of its point fetch and costs us
+nothing.** Same n, same engine, 4K -> 128K:
+
+    zeroskip   206482 -> 208175  (+1%)     167543 -> 167687  (+0%)
+    stock      149897 ->  85191  (-43%)    131664 ->  84882  (-36%)
+
+The mechanism is read amplification: stock's btree asks for a 4K page and
+ZFS must fetch, decompress and decrypt a whole 128K record to serve it.
+We map files and walk sequential runs, so a large record is free or
+better.  **This is the important part: 128K is already the write
+recommendation** (-40% on a bulk load, with `zs_rollover=64MB`), so the
+two levers COMPOUND rather than trading off.  Choosing 128K for writes
+takes our fetch advantage from 1.27-1.38x to 1.98-2.44x.
+
+**The scan deficit is gone, and it was a cache-residency artifact.** The
+matrix records 0.56-0.68x and this document has said "stock's packed pages
+keep a structural scan edge".  At scale that is false -- 0.99x/0.92x at 4K
+and 1.11x/1.09x at 128K.  Stock's scan collapses with size while ours does
+not:
+
+    stock, 4K:   20k 10.45M -> 200k 6.29M -> 2M 6.96M
+    zeroskip:    20k  6.04M -> 200k 6.25M -> 2M 6.43M
+
+Ours is flat across a 100x range because a merge step costs the same per
+row however large the database is.  Stock's 20k figure is its page cache
+holding the entire 2MB database; at 22MB and up it starts missing, and the
+"structural edge" turns out to have been SQLite's cache, not packed pages.
+**Any scan ratio measured at 20k should be read as a cache benchmark.**
+
+**Our fetch degrades 19% from 200k to 2M** on both recordsizes (206k ->
+167k), which is D-14d showing up as expected: point-lookup cost is
+proportional to the file count and 2M records make more files.  Stock
+degrades 12% at 4K and is flat at 128K -- flat, but at half our rate.
+
+**Still untested: format 3 against format 2 on production.** Everything
+above is zeroskip-against-stock, which is a different question.  The
++14%/+37% that justify the format are laptop and upstream numbers; testing
+them here needs a second library arm built on the box, the way the
+four-arm sweep was done locally.
+
 ##### Production on 3.1.1 (2026-08-22, stl-imap-09): what moved and what did not
 
 `/tmp/zsprod-311`, commit 2fc7ca616c, vendored f365bc4, both recordsizes
