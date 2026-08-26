@@ -42,6 +42,14 @@
 # which is a far more useful thing to hand back.  SHAPES=withoutrowid tests the
 # large-key end, where the design predicts format 3 is worst.
 #
+#   VACUUM=1                 compact (zs_db_compact via SQL VACUUM) between the
+#                            build and the reads.  This is a DISCRIMINATOR, not
+#                            a tuning knob: if format 3's fetch deficit is one
+#                            extra indirection per LOOKUP it survives collapsing
+#                            the database to a single file, and if it is one per
+#                            matched FILE it should mostly vanish.  The file
+#                            count printed per cell is the proof the compaction
+#                            happened -- expect 1 or 2, not 5-8.
 #   SIZES="200000 2000000"   record counts
 #   VALS="100 200 400"       value sizes, bytes -- the ratio under test
 #   SHAPES="rowid"           add "withoutrowid" for the large-key end
@@ -52,7 +60,9 @@ SIZES=${SIZES:-"200000 2000000"}
 VALS=${VALS:-"100 200 400"}
 SHAPES=${SHAPES:-"rowid"}
 PASSES=${PASSES:-5}
+VACUUM=${VACUUM:-0}
 OUT=${OUT:-/tmp/zsfmt2-$(date +%Y%m%d-%H%M%S)}
+if [ "$VACUUM" = 1 ]; then VACFLAG=--vacuum; else VACFLAG=; fi
 
 [ -f ./Makefile ] || { echo "run from a configured build directory" >&2; exit 2; }
 [ $# -ge 1 ] || { echo "usage: $0 DATASET_MOUNTPOINT [MORE...]" >&2; exit 2; }
@@ -123,6 +133,7 @@ echo "commit:   $(git rev-parse HEAD)"
 echo "fmt2 arm: $FMT2 ($(git show -s --format=%s "$FMT2" | cut -c1-60))"
 echo "guard:    fmt2 magic digit '$d2', fmt3 magic digit '$d3'"
 echo "sweep:    sizes=[$SIZES] values=[$VALS] shapes=[$SHAPES] passes=$PASSES"
+echo "vacuum:   $([ "$VACUUM" = 1 ] && echo 'YES -- compacted before the reads' || echo no)"
 for d in "$@"; do
   ds=$(df --output=source "$d" 2>/dev/null | tail -1)
   echo "-- $d recordsize $(zfs get -H -o value recordsize "$ds" 2>/dev/null || echo '?')"
@@ -141,7 +152,7 @@ for d in "$@"; do
           for a in $order; do
             w="$d/f2ab"; rm -rf "$w"; mkdir -p "$w"
             "./zskvbench.$a" --dir "$w" -n "$n" --value "$v" --reps 1 \
-                $shflag --only reads 2>&1 | sed "s/^/$rs|$sh|$v|$n|$a|/"
+                $shflag $VACFLAG --only reads 2>&1 | sed "s/^/$rs|$sh|$v|$n|$a|/"
             rm -rf "$w"
           done
         done
