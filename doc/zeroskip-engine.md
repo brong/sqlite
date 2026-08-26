@@ -1923,17 +1923,74 @@ cost: format 3 is behind despite a file-count advantage.  The only cells
 biased the other way are 200k at 100B, where format 3 carries an extra
 file, and there its -1..-5% is an upper bound.
 
-**A hypothesis, offered and not measured.** A format-3 fetch touches two
-regions at different offsets -- the key entry, then the value it points at
--- where format 2 touched one record.  At small sizes those land close
-enough to share page and TLB coverage; as the file grows they are
-megabytes apart, so the indirection costs a second miss that the denser
-search no longer pays for.  That would explain a win that shrinks with
-size, which is precisely the axis upstream expects it to grow along.  It
-predicts the deficit tracks file SIZE rather than record count, which is
-testable by holding records constant and varying the value size -- our 2M
-rows do vary it, and the deficit does narrow as values fatten (-7..-11% at
-100B, -3..-7% at 200B, -2..-5%/overlap at 400B), which is consistent.
+##### WITHOUT ROWID: the governing variable is KEY size, not value size
+
+The rowid sweep above suggested the crossover was in the value:key ratio
+-- fat values ahead, thin values behind.  **The WITHOUT ROWID sweep says
+that reading was wrong.** With a large key, format 3 loses at every value
+size and every record count, twelve cells out of twelve:
+
+| | 100B | 200B | 400B |
+|---|---|---|---|
+| 200k | -6..-9% | -7..-10% | -6..-9% |
+| 2M | -9..-13% | -8..-12% | -10..-19% |
+
+Flat in value size, which is exactly what the ratio hypothesis forbids.
+Taking only the cells that are clean or where format 3 held a file-count
+*advantage* and lost anyway, the deficit is **-7..-13%**.
+
+So the variable that decides it is the KEY.  With a small integer key,
+format 3's keys region really is an order of magnitude smaller than the
+records region, and the denser search can pay for the extra hop to the
+value -- narrowly, and only while the database is small (+1..6% at 200k;
+negative by 2M).  With a large key it cannot: our WITHOUT ROWID key is the
+whole encoded record, so the keys region is not meaningfully smaller than
+what it replaced, and the indirection is pure loss.
+
+That is upstream's own stated risk, and it is worse than they framed it.
+`format3-split-design.md` says the win is "zero or negative for large keys
+with small values ... This is the main risk the design carries."  It is
+negative for large keys at **every** value size we measured, 400B included.
+
+**This is the shape our indexes are.** SQLite stores every index, and every
+WITHOUT ROWID table, in exactly this layout, and this engine encodes such a
+key as the whole record.  So format 3 costs 7-13% on every index point
+lookup at scale.
+
+##### The scan win is NOT the value:key ratio either
+
+Format 3 wins every scan cell in both shapes, but it wins WITHOUT ROWID
+*harder* than rowid:
+
+    rowid          100B  +1..17%   200B  +8..21%   400B  +26..41%
+    WITHOUT ROWID  100B +19..34%   200B +32..46%   400B  +30..61%
+
+At WITHOUT ROWID the value:key ratio is about 1, which is where the split
+should help LEAST -- and it helps most.  So whatever drives the scan win,
+it is not the working-set argument as stated.  A guess, offered as a guess:
+format 2 interleaves key and value bytes within each record, so a merged
+scan's comparator drags value bytes through cache while stepping, and
+WITHOUT ROWID doubles those bytes because the record is stored twice.
+Format 3 makes both regions pure sequential runs regardless.  That would
+predict the win tracks how much non-key material format 2 interleaves,
+which the duplication maximises.  Not measured.
+
+**Write amplification inverts with shape too**: format 3 rewrites LESS at
+WITHOUT ROWID (10.8x of stored against 11.5x at 400B/2M, 7.7x against 9.2x
+at 400B/200k) where it rewrote MORE on rowid tables.
+
+##### A hypothesis about the fetch deficit, offered and not measured
+
+A format-3 fetch touches two regions at different offsets -- the key entry,
+then the value it points at -- where format 2 touched one record.  At small
+sizes those land close enough to share page and TLB coverage; as the file
+grows they are megabytes apart, so the indirection costs a second miss that
+the denser search no longer pays for.  That explains a win shrinking with
+size, which is the axis upstream expects it to grow along, and it explains
+why a large key kills the win outright: the search saves nothing to offset
+the hop.  It is consistent with the rowid deficit narrowing as values
+fatten (-7..-11% at 100B, -3..-7% at 200B, -2..-5%/overlap at 400B) and
+with the WITHOUT ROWID deficit not narrowing at all.
 
 **The memory column is NOT evidence for either format.** Format 3 uses
 consistently less -- 880MB against 1019MB at 400B/2M, 520 against 563 at
