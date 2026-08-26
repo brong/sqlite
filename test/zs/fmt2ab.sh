@@ -30,11 +30,28 @@
 # writes a database, and the magic's version digit in an IN-ORDER file's header
 # is read back: '1' for format 2, '2' for format 3.  If they do not differ, the
 # script stops before measuring anything.
+#
+# WHY IT SWEEPS VALUE SIZE.  Format 3's case is that a seek walks a structure
+# smaller than the old records region by roughly the VALUE:KEY size ratio, at
+# the price of one extra indirection to reach the value.  That predicts a SIGN
+# CHANGE: fat values win, thin values lose, and the ratio decides where.  The
+# first run of this script measured one value size and found format 3 SLOWER on
+# fetch, which contradicts upstream head-on -- but a contradiction at a single
+# point on a curve whose SHAPE is the actual claim is not yet an answer.
+# Sweeping it turns "the claim is wrong" into "the claim holds above ratio X",
+# which is a far more useful thing to hand back.  SHAPES=withoutrowid tests the
+# large-key end, where the design predicts format 3 is worst.
+#
+#   SIZES="200000 2000000"   record counts
+#   VALS="100 200 400"       value sizes, bytes -- the ratio under test
+#   SHAPES="rowid"           add "withoutrowid" for the large-key end
+#   PASSES=5                 three has repeatedly proved too few on these boxes
 set -u
 FMT2=${FMT2:-e2bba7b2e8}
-N_SMALL=${N_SMALL:-200000}
-N_BIG=${N_BIG:-2000000}
-PASSES=${PASSES:-3}
+SIZES=${SIZES:-"200000 2000000"}
+VALS=${VALS:-"100 200 400"}
+SHAPES=${SHAPES:-"rowid"}
+PASSES=${PASSES:-5}
 OUT=${OUT:-/tmp/zsfmt2-$(date +%Y%m%d-%H%M%S)}
 
 [ -f ./Makefile ] || { echo "run from a configured build directory" >&2; exit 2; }
@@ -105,25 +122,76 @@ echo "  ok -- the arms differ in what they WROTE, not merely in their binaries"
 echo "commit:   $(git rev-parse HEAD)"
 echo "fmt2 arm: $FMT2 ($(git show -s --format=%s "$FMT2" | cut -c1-60))"
 echo "guard:    fmt2 magic digit '$d2', fmt3 magic digit '$d3'"
+echo "sweep:    sizes=[$SIZES] values=[$VALS] shapes=[$SHAPES] passes=$PASSES"
 for d in "$@"; do
   ds=$(df --output=source "$d" 2>/dev/null | tail -1)
   echo "-- $d recordsize $(zfs get -H -o value recordsize "$ds" 2>/dev/null || echo '?')"
 done
 } | tee "$OUT/env.txt"
 
+RAW="$OUT/reads.txt"; : > "$RAW"
 for d in "$@"; do
-  for n in "$N_SMALL" "$N_BIG"; do
-    for p in $(seq 1 "$PASSES"); do
-      if [ $((p % 2)) -eq 1 ]; then order="fmt2 fmt3"; else order="fmt3 fmt2"; fi
-      for a in $order; do
-        w="$d/f2ab"; rm -rf "$w"; mkdir -p "$w"
-        echo "-- $d n=$n pass=$p arm=$a"
-        "./zskvbench.$a" --dir "$w" -n "$n" --reps 1 --rowid --only reads
-        rm -rf "$w"
+  rs=$(basename "$d")
+  for sh in $SHAPES; do
+    if [ "$sh" = rowid ]; then shflag=--rowid; else shflag=; fi
+    for v in $VALS; do
+      for n in $SIZES; do
+        for p in $(seq 1 "$PASSES"); do
+          if [ $((p % 2)) -eq 1 ]; then order="fmt2 fmt3"; else order="fmt3 fmt2"; fi
+          for a in $order; do
+            w="$d/f2ab"; rm -rf "$w"; mkdir -p "$w"
+            "./zskvbench.$a" --dir "$w" -n "$n" --value "$v" --reps 1 \
+                $shflag --only reads 2>&1 | sed "s/^/$rs|$sh|$v|$n|$a|/"
+            rm -rf "$w"
+          done
+        done
+        echo "  done $rs $sh value=$v n=$n" >&2
       done
     done
   done
-done | tee "$OUT/reads.txt"
+done | tee -a "$RAW"
 
-echo
-echo "wrote $OUT/reads.txt"
+python3 - "$RAW" <<'PYEOF' | tee "$OUT/summary.txt"
+import re, sys, collections
+V = collections.defaultdict(lambda: collections.defaultdict(list))
+F = collections.defaultdict(lambda: collections.defaultdict(set))
+row  = re.compile(r'^([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|\s+(fetch|scan)\s+([\d.]+)/s')
+fcnt = re.compile(r'^([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|\s+files in the database\s+(\d+)')
+for l in open(sys.argv[1]):
+    m = row.match(l)
+    if m:
+        rs,sh,v,n,arm,what,rate = m.groups()
+        V[(rs,sh,int(v),int(n),what)][arm].append(float(rate))
+    m = fcnt.match(l)
+    if m:
+        rs,sh,v,n,arm,c = m.groups()
+        F[(rs,sh,int(v),int(n))][arm].add(int(c))
+
+def verdict(a,b):
+    if not a or not b: return "no data"
+    if min(b) > max(a): return "fmt3 FASTER  +%.0f..%.0f%%" % ((min(b)/max(a)-1)*100,(max(b)/min(a)-1)*100)
+    if max(b) < min(a): return "fmt3 SLOWER  %.0f..%.0f%%"  % ((max(b)/min(a)-1)*100,(min(b)/max(a)-1)*100)
+    return "overlap (no result)"
+
+print()
+print("Format 2 -> format 3.  Ranges over all passes, arm order alternated.")
+print("A verdict is called ONLY where the two ranges do not overlap.")
+print("File counts are printed because D-14d makes a lookup linear in them:")
+print("if they differ, the fetch row is about the cascade, not the layout.\n")
+for rs,sh,v,n in sorted({(k[0],k[1],k[2],k[3]) for k in V}):
+    f = F[(rs,sh,v,n)]
+    same = f.get('fmt2') == f.get('fmt3')
+    note = "" if same else "   <-- DIFFER: D-14d confound, NOT a layout result"
+    print("=== %s  %s  value=%dB  n=%d ===  files fmt2=%s fmt3=%s%s" % (
+        rs, sh, v, n, sorted(f.get('fmt2',['?'])), sorted(f.get('fmt3',['?'])), note))
+    for what in ("fetch","scan"):
+        d = V[(rs,sh,v,n,what)]
+        a,b = d.get('fmt2',[]), d.get('fmt3',[])
+        if not a or not b: continue
+        print("  %-6s fmt2 %9.0f-%-9.0f fmt3 %9.0f-%-9.0f  %s" % (
+            what, min(a), max(a), min(b), max(b), verdict(a,b)))
+    print()
+PYEOF
+
+echo "raw:     $RAW"
+echo "summary: $OUT/summary.txt"
