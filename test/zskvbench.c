@@ -264,6 +264,26 @@ static int seal_now(sqlite3 *db){ (void)db; return 0; }
 ** file's bytes -- it frames each record -- so the multiple below is a
 ** ratio of comparable-to-itself figures across runs rather than a number
 ** to hold against upstream's.  The MB and ms are exact. */
+/* Peak RSS of this process, in MB.
+**
+** Reported from getrusage rather than left to `/usr/bin/time -v`, because the
+** first production run of the merge_memory sweep came back with no memory
+** figures at all: GNU time is a separate package, it is not installed on
+** stl-imap-09, and the phase silently measured only half the question.  A knob
+** whose entire purpose is a memory ceiling has to report memory itself.
+**
+** ru_maxrss is BYTES on macOS/BSD and KILOBYTES on Linux -- getting that wrong
+** is a 1024x error in whichever direction, which would read as a real result. */
+static double peak_rss_mb(void){
+  struct rusage ru;
+  if( getrusage(RUSAGE_SELF, &ru)!=0 ) return 0.0;
+#if defined(__APPLE__)
+  return (double)ru.ru_maxrss / 1048576.0;
+#else
+  return (double)ru.ru_maxrss / 1024.0;
+#endif
+}
+
 static void print_rewrites(const sqlite3_uint64 *a, double stored){
   double rw = (double)a[2] + (double)a[6];
   printf("  %-34s%.1fx of stored  (%llu conversions %.0fMB %.0fms;"
@@ -272,6 +292,7 @@ static void print_rewrites(const sqlite3_uint64 *a, double stored){
          (unsigned long long)a[4], (double)a[6]/1e6, (double)a[7]/1e6,
          (unsigned long long)a[0], (double)a[2]/1e6, (double)a[3]/1e6,
          stored/1e6);
+  printf("  %-34s%.0fMB\n", "peak RSS", peak_rss_mb());
 }
 
 /* Build a database with the cascade disarmed and LEAVE it, for a cold-merge

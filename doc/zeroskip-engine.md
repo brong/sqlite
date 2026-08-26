@@ -1871,11 +1871,53 @@ shape: the 64MB ceiling buys ~3MB of RSS and no speed, because our merge
 The real choice is default-versus-hold: holding everything is the only
 arm that separates (526-548ms, ~6% of merge) and it costs +300MB.
 
-**APFS cannot settle it.** The argument for holding is that streaming
-walks its input a second time and may re-fault it from disk -- precisely
-when the merge is big enough for the memory to matter.  That is an
-ARC/ZFS question, which is why `prodrun.sh` now carries a `mergemem`
-phase.
+**APFS could not settle it** -- the argument for holding is that streaming
+walks its input a second time and may re-fault it from disk, precisely
+when the merge is big enough for the memory to matter, and that is an
+ARC question.  So `prodrun.sh` carries a `mergemem` phase, and it has now
+run.
+
+##### merge_memory on ZFS: the knob does nothing, so take the memory
+
+stl-imap-09, library 3.1.1, three passes per setting with the order
+rotated, both recordsizes, both sizes.  Merge total is conversions plus
+repacks from the library's own counters:
+
+| | 4K, 2M | 128K, 2M |
+|---|---:|---:|
+| `mm=1B` (all streamed) | 4479-4543ms | 2372-2413ms |
+| default 64MB | 4511-4543ms | 2355-2388ms |
+| `mm=1GB` (all held) | 4533-4579ms | 2385-2409ms |
+
+**Every merge comparison overlaps**, at both recordsizes and at both 200k
+and 2M.  The knob has no measurable effect on ZFS at any setting.  One
+row reads SEPARATE -- 128K/2M store, hold 367773-368188/s against stream
+365791-367512 -- and it is not a finding: 0.1-0.6%, three passes, ranges
+nearly touching, and the quieter instrument (the merge counters) overlaps.
+
+That **inverts the laptop's answer**, where holding bought ~6%.  The
+reason is that a merge on ZFS is I/O-bound: 841MB of repacks costs
+4.34-4.48 ms/MB at 4K, against roughly 0.5 ms/MB on APFS.  Whatever the
+CPU-side difference between streaming and holding is, it is swamped.
+Upstream's "second walk" argument is real on a laptop and invisible here.
+
+**Deployment answer: stream.** On production the memory is free -- 315MB
+against 620MB at 2M records, for no measurable time.  We keep the library
+default rather than setting `zs_merge_memory=1` explicitly, because the
+default is already indistinguishable from always-stream at our shape (the
+64MB ceiling buys ~3MB, since our merge bytes concentrate in the few
+cascade merges that exceed it).  The knob's value is bounding a
+compaction, which is what 3.1.0 added it for.
+
+**A gap in the first run, and the fix.** That run came back with no memory
+figures at all: the phase leaned on `/usr/bin/time -v`, GNU time is a
+separate package, and it is not installed on stl-imap-09 -- so a sweep
+whose entire subject is a memory ceiling silently measured only half the
+question.  `zskvbench` now reports peak RSS itself from `getrusage`, which
+has no dependency to be missing.  (`ru_maxrss` is bytes on macOS and
+kilobytes on Linux; getting that wrong is a 1024x error that would read as
+a real result.)  The RSS column above is from the laptop; the production
+re-run will carry its own.
 
 ##### twom was checked and needs nothing
 

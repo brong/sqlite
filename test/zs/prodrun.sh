@@ -242,13 +242,12 @@ say "phase: merge_memory -- what the A-20 ceiling costs and buys"
 # decide it: the second walk streaming needs re-reads its input, and whether
 # that costs is a ZFS/ARC question.
 #
-# RSS is half the answer, so capture it rather than timing alone.  GNU time
-# reports it; if it is absent the rows still carry the library's own merge
-# counters, which is what the timing argument turns on.
-TIMEV=""
-command -v /usr/bin/time >/dev/null 2>&1 && /usr/bin/time -v true >/dev/null 2>&1 \
-    && TIMEV="/usr/bin/time -v"
-[ -n "$TIMEV" ] || echo "note: GNU time -v unavailable; peak RSS not captured"
+# RSS is half the answer and zskvbench reports it itself, from getrusage.
+# The first production run of this phase came back with NO memory figures at
+# all: it leaned on `/usr/bin/time -v`, GNU time is a separate package, and it
+# is not installed on stl-imap-09 -- so the phase silently measured half the
+# question and the whole point of the knob went unrecorded.  A sweep of a
+# memory ceiling must not depend on an optional package.
 for d in "$@"; do
   for n in "$NMID" "$NBIG"; do
     # 1 byte = nothing ever fits, so every region streams.  A ceiling nothing
@@ -266,11 +265,10 @@ for d in "$@"; do
         w="$d/mm"; rm -rf "$w"; mkdir -p "$w"
         echo "-- $d n=$n pass=$pass merge_memory=${mm:-<default 64MB>}"
         if [ -n "$mm" ]; then
-          $TIMEV ./zskvbench --dir "$w" -n "$n" --reps 1 --rowid --only 1000 \
-            --uri "zs_merge_memory=$mm" 2>&1 | grep -vE "^\s*(Command being|User time|System time|Percent of|Elapsed|Average|Voluntary|Involuntary|Swaps|File system|Socket|Signals|Page size|Exit status|Minor|Major)" 
+          ./zskvbench --dir "$w" -n "$n" --reps 1 --rowid --only 1000 \
+            --uri "zs_merge_memory=$mm"
         else
-          $TIMEV ./zskvbench --dir "$w" -n "$n" --reps 1 --rowid --only 1000 \
-            2>&1 | grep -vE "^\s*(Command being|User time|System time|Percent of|Elapsed|Average|Voluntary|Involuntary|Swaps|File system|Socket|Signals|Page size|Exit status|Minor|Major)"
+          ./zskvbench --dir "$w" -n "$n" --reps 1 --rowid --only 1000
         fi
         rm -rf "$w"
       done
