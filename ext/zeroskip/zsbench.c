@@ -1051,11 +1051,19 @@ static void bench_scan(void)
     bench_scan_once(db, "scan_compacted", "full scan, compacted");
     zs_db_close(&db);
 
-    /* Format 2 had a `full scan, no verify` line here, opening the same fixture
-     * with ZS_NOCSUM to price what record verification cost.  No record carries
-     * a checksum now (F-13a) and an in-order file's regions are never verified
-     * on a read path (F-33a), so there is nothing left to switch off and nothing
-     * left to price: every scan above is already the no-verify scan. */
+    /* There is no "full scan, no verify" row any more.  It priced ZS_NOCSUM
+     * against a verifying scan, and since version 4 no record carries a checksum
+     * (F-32), so a scan verifies nothing and the flag is rejected outright
+     * (A-18).  The row would have measured two identical configurations, and its
+     * open now fails.
+     *
+     * What it measured is worth remembering rather than the row: verification was
+     * the largest single item in a scan profile, and larger than the profile
+     * suggested, because a key-only traversal never dereferences the values a
+     * cursor hands back -- so verifying pulled every value byte into cache that
+     * the scan would otherwise never read.  The cost was memory traffic, not
+     * hashing, which is why removing it is worth more than a faster hash would
+     * have been. */
 
     fixture_done(plain);
     fixture_done(compacted);
@@ -1173,7 +1181,7 @@ static void bench_scan_merge(void)
  * a different machine from a file cursor: its position is a KEY rather than an
  * index (D-14j-a), so each step re-resolves it by binary search over the
  * pending array, and each record is decoded back out of the active file through
- * the transaction's mappings rather than read straight from a keys region.
+ * the transaction's mappings rather than read straight from a pointer section.
  *
  * It exists for the same reason bench_read_after_write does, one level up.  That
  * one covers point reads inside a write transaction; nothing covered a WALK, so

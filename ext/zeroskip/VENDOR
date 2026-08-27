@@ -1,3 +1,73 @@
+source: f7521ee
+date: 2026-08-27 (library 4.0.0 -- FORMAT 4.  An ABI break and an on-disk break.
+      A version-4 build refuses a version-2 or version-3 file at open, there is
+      no migrator, and existing data must be dumped and reloaded.
+
+      FORMAT 3 WAS WITHDRAWN AND NEVER RELEASED.  Upstream went 2.9.2 -> 4.0.0,
+      skipped the version number so the two layouts can never be confused, and
+      says version 3 must never be written.  The files it refers to as existing
+      "outside this repository" are OURS: everything this branch wrote between
+      2026-08-21 and today.  What we vendored as 3.0.0/3.1.0/3.1.1 was that
+      unreleased line; 3.1.1's xxhash work is in the released tree as 2.9.2.
+
+      THE SHAPE.  Both file kinds now hold the same self-framing record: a
+      4-bit flag nibble in the low half of byte 0, then keylen and vallen (4
+      bytes of header while keylen <= 4095 and vallen <= 65535, 16 above that),
+      then key NUL value NUL, PACKED rather than rounded up to a multiple of 8.
+      An in-order file is [header][records][pad][pointers][trailer], the
+      pointer array AFTER the data, a 32-byte trailer naming it and carrying
+      one checksum over the whole file.  So key/value ADJACENCY is back, which
+      is the property format 3 gave up and the one our production A/B said was
+      costing us on fetch.
+
+      THE API BREAK THAT REACHED US IS NOT THE ONE THEY FLAGGED.  Upstream
+      warned about zs_csum returning uint64_t (external engines only -- we
+      supply none) and ZS_NOCSUM being rejected rather than ignored (already
+      deleted here at format 3).  Neither touched the build.  What did was
+      merge_memory, REMOVED from zs_open_data -- unmentioned, because they diff
+      4.0.0 against 2.9.2, which never had the field, and we were on the 3.1.x
+      line that did.  Deleted here: btree_zs.c's uriMergeMemory, the URI
+      parameter zs_merge_memory, and prodrun.sh's mergemem phase (deleted, not
+      disabled -- SQLite ignores an unrecognised URI parameter silently, so the
+      phase would have run three identical arms and printed a clean null).
+      The bound is now structural: the pointer array last means a merge holds 8
+      bytes per record in one pass.  It still does NOT bound a merge's mapped
+      INPUTS, which are what made a 2M VACUUM peak at 1.2-1.4GB, so that figure
+      is still a format-3 number until someone re-measures it.
+
+      WHAT WE MEASURED, AND WHAT WE DID NOT.  On-disk size is deterministic and
+      a laptop may decide it: 200k records, identical file counts in both arms,
+      format 4 is -4.4% (rowid/100B), -2.3% (rowid/400B), -2.4% (WITHOUT
+      ROWID/100B), -3.4% (WITHOUT ROWID/400B).  Upstream's -3.1% holds on our
+      shapes.  THE READ COMPARISON IS OPEN and belongs on the ZFS box:
+      test/zs/fmt2ab.sh is retargeted (guard demands magic digits '1' and '4';
+      a '2' is the withdrawn format 3 and means a stale tree), and both arms
+      now share the CURRENT src/btree_zs.c, because removing merge_memory left
+      the old and new versions of that file differing only in comments and the
+      dead zs_nocsum plumbing.  Only the library moves now.
+
+      THE FORMAT-GUARD PREDICTION WAS WRONG AND THE SUITE PASSED UNCHANGED.
+      Upstream expected the checked-in format-2 fixture to stop opening.  The
+      refusal is per FILE: zs_db_open still skips a member it cannot decode, so
+      a directory whose members are all refused is indistinguishable from an
+      empty one to an open with ZS_CREATE, and the caller-visible answer is
+      still an empty database.  The guard now proves that is the mechanism by
+      putting the same file BESIDE a readable database, where it does surface
+      as SQLITE_CORRUPT, and a fixtures/fmt3-db is checked in beside fmt2-db.
+
+      AND THE HAZARD OUR OWN DOC HAD BACKWARDS.  A write into a superseded
+      directory does not start a fresh generation beside the old data -- it
+      reuses the same active-file name and TRUNCATES it (12712 bytes -> 277,
+      schema gone).  A read is safe.  NOT new at version 4: the format-3 build
+      destroys a format-2 directory identically, measured on both arms.  So
+      "dump and reload" is an instruction to follow BEFORE upgrading, and
+      format-guard.sh now asserts both halves.
+
+      Test tier on this laptop, all green: zskey-test, zsbtree-test, the 10 SQL
+      batteries, format-guard (with the new cases, each mutation-checked),
+      crash-test 10 rounds, busy-test, backup-concurrent, twowriter (6),
+      metacache (8), and the TCL permutation at 966/966 clean files.
+
 source: f365bc4
 date: 2026-08-22 (library 3.1.1 -- xxhash stops being pessimised, and hashing
       is about 3x faster for it.  Our finding, taken upstream and released the

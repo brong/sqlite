@@ -114,9 +114,13 @@ struct Btree {
                                 ** the library's 2MB default.  Bytes only --
                                 ** see zsbtEnsureOpen for why the span bound
                                 ** is left where it is */
-  sqlite3_int64 uriMergeMemory; /* URI zs_merge_memory=BYTES: A-20's ceiling on
-                                ** what a merge or conversion holds, 0 = the
-                                ** library's 64MB default */
+  /* There was a uriMergeMemory here (URI zs_merge_memory=BYTES ->
+  ** setup.merge_memory).  It bounded what an in-order output could hold,
+  ** because format 3 built the output in memory before it could checksum and
+  ** write it, and a compaction's output is O(DATABASE).  Format 4 puts the
+  ** pointer array AFTER the records, so a merge holds 8 bytes per record in a
+  ** single pass and there is no output to bound; upstream removed the field
+  ** with the format.  See the doc: the ceiling is gone, not defaulted. */
   sqlite3_int64 uriRolloverTxns; /* URI zs_rollover_txns=N: the replay window in
                                 ** SPANS.  Exists for FIXTURES, which must pin
                                 ** any bound they depend on -- upstream's own
@@ -561,23 +565,16 @@ static int zsbtEnsureOpen(Btree *p){
   ** so a large rollover wants the pointer-table cache (zs_index=local) with
   ** it, not instead of it. */
   if( p->uriRollover>0 ) setup.rollover_size = (size_t)p->uriRollover;
-  /* merge_memory (A-20, library default 64MB) bounds what an in-order output
-  ** may hold: a region that fits is held and checksummed in ONE call, a larger
-  ** one streams through a 256KB window.  Exposed because this engine calls
-  ** zs_db_compact from VACUUM and from a backup's finish, and a compaction's
-  ** output is O(DATABASE) -- before 3.1.0 that meant a database larger than
-  ** memory could not be compacted at all, and nothing said why.
-  **
-  ** Left at the default deliberately.  Measured here at 2M records: 3.1.0
-  ** halves peak RSS against 3.0.0 (629-634MB -> 318-319MB) and is 34% BELOW
-  ** format 2 as well, while the merge counters return to format 2's range.
-  ** So the default already buys the memory without costing the speed, and the
-  ** knob is here for a caller that knows its own ceiling -- raise it to keep
-  ** the one-shot checksum on bigger outputs, lower it to bound memory harder
-  ** at about 6% of a bulk load when everything streams. */
-  if( p->uriMergeMemory>0 ){
-    setup.merge_memory = (size_t)p->uriMergeMemory;
-  }
+  /* There is no merge_memory to set any more.  Format 3 needed it because an
+  ** in-order file's regions had to be sized before the first byte was written,
+  ** so a merge accumulated its output; the ceiling existed so that a
+  ** zs_db_compact -- which this engine calls from VACUUM and from a backup's
+  ** finish, and whose output is O(DATABASE) -- could run on a database larger
+  ** than memory.  Format 4's pointer array comes last and its trailer carries
+  ** the section offsets, so the output streams and the merge's own memory is
+  ** 8 bytes per record.  Whether that actually bounds VACUUM's peak is a
+  ** MEASUREMENT we owe: merge_memory never bounded the mapped INPUTS, and
+  ** those are what made VACUUM peak at 1.2-1.4GB at 2M records. */
   if( p->uriRolloverTxns>0 ){
     setup.rollover_txns = (size_t)p->uriRolloverTxns;
   }
@@ -688,7 +685,6 @@ int sqlite3BtreeOpen(
       }
       p->uriNoRepack = (u8)sqlite3_uri_boolean(zFilename, "zs_norepack", 0);
       p->uriRollover = sqlite3_uri_int64(zFilename, "zs_rollover", 0);
-      p->uriMergeMemory = sqlite3_uri_int64(zFilename, "zs_merge_memory", 0);
       p->uriRolloverTxns = sqlite3_uri_int64(zFilename, "zs_rollover_txns", 0);
       zCsum = sqlite3_uri_parameter(zFilename, "zs_csum");
       if( zCsum && strcmp(zCsum, "none")==0 ) p->uriCsumNone = 1;

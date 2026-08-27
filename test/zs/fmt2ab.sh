@@ -1,10 +1,17 @@
 #!/bin/bash
-# Format 2 against format 3, on the same host, for the READ rows.
+# Format 2 against format 4, on the same host, for the READ rows.
 #
 # This is the one comparison the matrix and the stock-vs-zeroskip runs cannot
 # make: everything else measures us against the btree, which is a different
-# question from whether key/value separation earned its place.  Upstream's
-# +14% fetch / +37% scan were measured on a laptop and on their own fixture.
+# question from whether a format change earned its place.
+#
+# WHY FORMAT 2 IS STILL THE BASELINE, after this script measured format 3.
+# Format 3 was WITHDRAWN -- upstream never released it, skipped the version
+# number so the two layouts can never be confused, and went to format 4 from
+# 2.9.2 instead.  So there is no fmt3-vs-fmt4 question to answer: format 3
+# exists only in this repository's history and in databases this branch wrote.
+# The live question is the one this script was always built for, against the
+# only format that ever shipped.
 #
 # THE ARM IS RECONSTRUCTED FROM THIS REPOSITORY'S HISTORY, not from a sibling
 # checkout, so it runs on a production box that has only this tree.  Commit
@@ -13,10 +20,15 @@
 # before format 3's implementation landed in 8dc8893 -- so this IS the arm,
 # and the intervening upstream commits are a spec and a design document.
 #
-# Its src/btree_zs.c comes from the same commit, because today's sets
-# setup.merge_memory and 2.9.1's zs_open_data has no such field.  The two
-# versions of that file differ ONLY by that field and by the removal of
-# zs_nocsum: nothing either arm's read path touches.
+# BOTH ARMS NOW SHARE THE CURRENT src/btree_zs.c, which they did not before.
+# The old arm used to need its own copy because today's set setup.merge_memory
+# and 2.9.1's zs_open_data has no such field; format 4 removed merge_memory, so
+# that reason is gone.  What remains between the two versions of that file is
+# comments plus the deleted zs_nocsum plumbing, which neither arm's read path
+# enters (the URI parameter defaults off and no run here sets it).  Holding the
+# engine byte-identical and moving ONLY the library is what the arm should have
+# been all along -- FMT2_BTREE=1 restores the old behaviour if a future
+# divergence makes today's file uncompilable against 2.9.1's header.
 #
 # test/zskvbench.c is the CURRENT one in both arms, deliberately.  The version
 # that shipped with the format-2 commit carried the (i * 7919) int overflow, so
@@ -28,34 +40,44 @@
 # only in their executables would satisfy a `cmp` and could still write the
 # same format -- a null instrument that reads as a clean result.  So each arm
 # writes a database, and the magic's version digit in an IN-ORDER file's header
-# is read back: '1' for format 2, '2' for format 3.  If they do not differ, the
-# script stops before measuring anything.
+# is read back: '1' for format 2 and '4' for format 4.  Do not derive one from
+# the other -- the digit began as a COUNT of incompatible formats ('1' meaning
+# format 2) and only became the version number at 4, and '2' means the
+# withdrawn format 3.  If the arms do not differ, the script stops before
+# measuring anything.
 #
-# WHY IT SWEEPS VALUE SIZE.  Format 3's case is that a seek walks a structure
-# smaller than the old records region by roughly the VALUE:KEY size ratio, at
-# the price of one extra indirection to reach the value.  That predicts a SIGN
-# CHANGE: fat values win, thin values lose, and the ratio decides where.  The
-# first run of this script measured one value size and found format 3 SLOWER on
-# fetch, which contradicts upstream head-on -- but a contradiction at a single
-# point on a curve whose SHAPE is the actual claim is not yet an answer.
-# Sweeping it turns "the claim is wrong" into "the claim holds above ratio X",
-# which is a far more useful thing to hand back.  SHAPES=withoutrowid tests the
-# large-key end, where the design predicts format 3 is worst.
+# WHAT THE MEASUREMENT IS FOR, and it is not the same claim as last time.
+# Format 3 split keys from values, which predicted a fetch win that grew with
+# the value:key ratio; this script found the opposite through SQL and the
+# governing variable was KEY size.  Format 4 goes back to key/value ADJACENCY
+# in one packed, self-framing record, so the mechanism predicts parity-or-better
+# on fetch rather than a regression.  Upstream measured -3.1% on disk
+# (deterministic) and +1.6-2.4% on point lookup on a laptop, and could not
+# resolve scan or store above noise.  The laptop-to-production transfer is
+# exactly what proved untrustworthy for format 3, which is why this runs here.
+#
+# THE VALUE SWEEP IS KEPT even though the ratio is no longer the claim: it is
+# what caught the sign error last time, and a format change that touches record
+# framing can still be size-dependent (the 4-byte header holds while keylen
+# <= 4095 and vallen <= 65535, and becomes 16 bytes above that -- so the sweep
+# should also step ACROSS 65535 at least once).  SHAPES=withoutrowid tests the
+# large-key end, which is the shape every SQLite INDEX uses.
 #
 #   VACUUM=1                 compact (zs_db_compact via SQL VACUUM) between the
-#                            build and the reads.  This is a DISCRIMINATOR, not
-#                            a tuning knob: if format 3's fetch deficit is one
-#                            extra indirection per LOOKUP it survives collapsing
-#                            the database to a single file, and if it is one per
-#                            matched FILE it should mostly vanish.  The file
-#                            count printed per cell is the proof the compaction
-#                            happened -- expect 1 or 2, not 5-8.
+#                            build and the reads.  It stays a DISCRIMINATOR:
+#                            a per-LOOKUP cost survives collapsing the database
+#                            to one file, a per-matched-FILE cost mostly
+#                            vanishes.  The file count printed per cell is the
+#                            proof the compaction happened -- expect 1 or 2, not
+#                            5-8.  It is also the only arm that exercises format
+#                            4's streaming merge on a big output.
 #   SIZES="200000 2000000"   record counts
-#   VALS="100 200 400"       value sizes, bytes -- the ratio under test
+#   VALS="100 200 400"       value sizes, bytes
 #   SHAPES="rowid"           add "withoutrowid" for the large-key end
 #   PASSES=5                 three has repeatedly proved too few on these boxes
 set -u
 FMT2=${FMT2:-e2bba7b2e8}
+FMT2_BTREE=${FMT2_BTREE:-0}    # 1 = also take btree_zs.c from $FMT2 (see header)
 SIZES=${SIZES:-"200000 2000000"}
 VALS=${VALS:-"100 200 400"}
 SHAPES=${SHAPES:-"rowid"}
@@ -88,16 +110,21 @@ build(){  # build ARMNAME  -- sources must already be in place
 echo "== building the format-2 arm from $FMT2 =="
 git show "$FMT2:ext/zeroskip/zeroskip.c" > ext/zeroskip/zeroskip.c || exit 1
 git show "$FMT2:ext/zeroskip/zeroskip.h" > ext/zeroskip/zeroskip.h || exit 1
-git show "$FMT2:src/btree_zs.c"          > src/btree_zs.c          || exit 1
+if [ "$FMT2_BTREE" = 1 ]; then
+  echo "   (also taking src/btree_zs.c from $FMT2 -- the arms differ by more"
+  echo "    than the library)"
+  git show "$FMT2:src/btree_zs.c"        > src/btree_zs.c          || exit 1
+fi
 build fmt2
-echo "== building the format-3 arm from the working tree =="
+echo "== building the format-4 arm from the working tree =="
 restore
-build fmt3
+build fmt4
 
 # ---- the guard: what did each arm actually WRITE? ----------------------------
 # Every zeroskip file header opens with the 16-byte magic, whose byte 9 is the
-# major format version as an ASCII digit.  An in-order file is the one that
-# carries format 3's keys_len/values_len, so that is the one read.
+# format digit ('1' = format 2, '4' = format 4).  An IN-ORDER file is read
+# rather than the active one, because that is where the two formats differ
+# structurally -- and because reaching one proves a conversion ran.
 fmtof(){  # fmtof BIN DIR -> prints the version digit and the magic
   local bin=$1 d=$2 f
   rm -rf "$d"; mkdir -p "$d"
@@ -114,14 +141,15 @@ fmtof(){  # fmtof BIN DIR -> prints the version digit and the magic
 G="$OUT/guard"
 echo "== guard: reading the format each arm wrote to disk =="
 m2=$(fmtof zskvbench.fmt2 "$G/a"); echo "  fmt2 arm magic: $m2"
-m3=$(fmtof zskvbench.fmt3 "$G/b"); echo "  fmt3 arm magic: $m3"
+m4=$(fmtof zskvbench.fmt4 "$G/b"); echo "  fmt4 arm magic: $m4"
 rm -rf "$G"
 d2=$(printf '%s' "$m2" | awk '{print $10}')
-d3=$(printf '%s' "$m3" | awk '{print $10}')
-echo "  version digit: fmt2='$d2'  fmt3='$d3'"
-if [ "$d2" != "1" ] || [ "$d3" != "2" ] || [ "$d2" = "$d3" ]; then
-  echo "GUARD FAILED: the two arms did not write different formats." >&2
-  echo "  Expected the format-2 arm to write '1' and the format-3 arm '2'." >&2
+d4=$(printf '%s' "$m4" | awk '{print $10}')
+echo "  version digit: fmt2='$d2'  fmt4='$d4'"
+if [ "$d2" != "1" ] || [ "$d4" != "4" ] || [ "$d2" = "$d4" ]; then
+  echo "GUARD FAILED: the two arms did not write the formats this run claims." >&2
+  echo "  Expected the format-2 arm to write '1' and the format-4 arm '4'." >&2
+  echo "  A '2' is the WITHDRAWN format 3 and means a stale working tree." >&2
   echo "  Measuring now would compare an arm against itself." >&2
   exit 1
 fi
@@ -131,7 +159,8 @@ echo "  ok -- the arms differ in what they WROTE, not merely in their binaries"
 {
 echo "commit:   $(git rev-parse HEAD)"
 echo "fmt2 arm: $FMT2 ($(git show -s --format=%s "$FMT2" | cut -c1-60))"
-echo "guard:    fmt2 magic digit '$d2', fmt3 magic digit '$d3'"
+echo "guard:    fmt2 magic digit '$d2', fmt4 magic digit '$d4'"
+echo "btree:    $([ "$FMT2_BTREE" = 1 ] && echo "per-arm ($FMT2 for fmt2)" || echo 'shared (current tree, both arms)')"
 echo "sweep:    sizes=[$SIZES] values=[$VALS] shapes=[$SHAPES] passes=$PASSES"
 echo "vacuum:   $([ "$VACUUM" = 1 ] && echo 'YES -- compacted before the reads' || echo no)"
 for d in "$@"; do
@@ -148,7 +177,7 @@ for d in "$@"; do
     for v in $VALS; do
       for n in $SIZES; do
         for p in $(seq 1 "$PASSES"); do
-          if [ $((p % 2)) -eq 1 ]; then order="fmt2 fmt3"; else order="fmt3 fmt2"; fi
+          if [ $((p % 2)) -eq 1 ]; then order="fmt2 fmt4"; else order="fmt4 fmt2"; fi
           for a in $order; do
             w="$d/f2ab"; rm -rf "$w"; mkdir -p "$w"
             "./zskvbench.$a" --dir "$w" -n "$n" --value "$v" --reps 1 \
@@ -180,26 +209,26 @@ for l in open(sys.argv[1]):
 
 def verdict(a,b):
     if not a or not b: return "no data"
-    if min(b) > max(a): return "fmt3 FASTER  +%.0f..%.0f%%" % ((min(b)/max(a)-1)*100,(max(b)/min(a)-1)*100)
-    if max(b) < min(a): return "fmt3 SLOWER  %.0f..%.0f%%"  % ((max(b)/min(a)-1)*100,(min(b)/max(a)-1)*100)
+    if min(b) > max(a): return "fmt4 FASTER  +%.0f..%.0f%%" % ((min(b)/max(a)-1)*100,(max(b)/min(a)-1)*100)
+    if max(b) < min(a): return "fmt4 SLOWER  %.0f..%.0f%%"  % ((max(b)/min(a)-1)*100,(min(b)/max(a)-1)*100)
     return "overlap (no result)"
 
 print()
-print("Format 2 -> format 3.  Ranges over all passes, arm order alternated.")
+print("Format 2 -> format 4.  Ranges over all passes, arm order alternated.")
 print("A verdict is called ONLY where the two ranges do not overlap.")
 print("File counts are printed because D-14d makes a lookup linear in them:")
 print("if they differ, the fetch row is about the cascade, not the layout.\n")
 for rs,sh,v,n in sorted({(k[0],k[1],k[2],k[3]) for k in V}):
     f = F[(rs,sh,v,n)]
-    same = f.get('fmt2') == f.get('fmt3')
+    same = f.get('fmt2') == f.get('fmt4')
     note = "" if same else "   <-- DIFFER: D-14d confound, NOT a layout result"
-    print("=== %s  %s  value=%dB  n=%d ===  files fmt2=%s fmt3=%s%s" % (
-        rs, sh, v, n, sorted(f.get('fmt2',['?'])), sorted(f.get('fmt3',['?'])), note))
+    print("=== %s  %s  value=%dB  n=%d ===  files fmt2=%s fmt4=%s%s" % (
+        rs, sh, v, n, sorted(f.get('fmt2',['?'])), sorted(f.get('fmt4',['?'])), note))
     for what in ("fetch","scan"):
         d = V[(rs,sh,v,n,what)]
-        a,b = d.get('fmt2',[]), d.get('fmt3',[])
+        a,b = d.get('fmt2',[]), d.get('fmt4',[])
         if not a or not b: continue
-        print("  %-6s fmt2 %9.0f-%-9.0f fmt3 %9.0f-%-9.0f  %s" % (
+        print("  %-6s fmt2 %9.0f-%-9.0f fmt4 %9.0f-%-9.0f  %s" % (
             what, min(a), max(a), min(b), max(b), verdict(a,b)))
     print()
 PYEOF

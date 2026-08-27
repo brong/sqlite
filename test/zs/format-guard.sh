@@ -74,33 +74,81 @@ if [ -d "$(dirname "$0")/fixtures/oldfmt-db" ]; then
   expect "pre-format-change database opens as empty (see header)" "0" "$out"
 fi
 
-# 4b. a database in on-disk FORMAT 2, written by library 2.9.1 (the
-#    version vendored immediately before format 3).  Distinct from case 4:
-#    that fixture is an older FILE NAMING layout, this one is the current
-#    naming with the previous FORMAT -- the magic's major version digit is
-#    '1' where a 3.0.0 writer puts '2'.  Regenerable, unlike case 4's:
-#    build zskvbench against the 2.9.1 sources and run --build-only.
+# 4b/4c. databases in the two SUPERSEDED on-disk formats, in the current
+#    file naming.  Distinct from case 4, which is an older file NAMING with
+#    a format this build could still read.  The magic's version digit tells
+#    them apart: '1' is format 2, '2' is format 3, '4' is format 4.  (The
+#    digit began as a count of incompatible formats and became the version
+#    at 4, so '3' is never written and format 3 was withdrawn entirely --
+#    do not infer one number from the other.)
 #
-#    The fixture holds a real 50-row `kv` table and its schema is still
-#    legible in the file (`strings` finds the CREATE TABLE), so a count of
-#    0 here is the engine declining to read data that is demonstrably
-#    present -- not an empty fixture passing vacuously.  Upstream rejects a
-#    foreign format at the magic (F-6b, R-6) and implements no migrator,
-#    which at this layer surfaces as an EMPTY database rather than an
-#    error.  Nothing has ever shipped on format 2 so nothing needs
-#    carrying forward, but a leftover benchmark or test directory from
-#    before 2026-08-21 will read empty and a write will start a fresh
-#    generation beside data still on disk.  If a version mismatch ever
-#    becomes a hard error, this expectation flips.
-if [ -d "$(dirname "$0")/fixtures/fmt2-db" ]; then
-  cp -r "$(dirname "$0")/fixtures/fmt2-db" "$W/dbfmt2"
-  chmod -R u+w "$W/dbfmt2"
-  out=$($SH "$W/dbfmt2" "SELECT count(*) FROM sqlite_master;" 2>&1)
-  expect "format-2 database opens as empty (see header)" "0" "$out"
+#    Both fixtures hold a real 50-row `kv` table whose schema is still
+#    legible in the file, so a count of 0 is the engine declining to read
+#    data that is demonstrably present -- not an empty fixture passing
+#    vacuously.  Regenerate fmt2-db by building zskvbench against the 2.9.1
+#    sources and running --build-only; fmt3-db was written by this tree at
+#    commit f8027d7a7e with the SQL in the case below.
+#
+#    UPSTREAM PREDICTED THESE WOULD FLIP AT VERSION 4 AND THEY DID NOT.
+#    4.0.0 refuses a version-2 or version-3 file at open rather than
+#    part-parsing it -- but that refusal is per FILE, and zs_db_open still
+#    skips a member it cannot decode rather than failing the open.  With
+#    every member refused the directory is indistinguishable from an empty
+#    one to a caller opening with ZS_CREATE, which is what this engine
+#    does, so the caller-visible answer is still an EMPTY DATABASE and not
+#    an error.  Case 4d below is where the refusal actually bites.
+for pair in "fmt2-db:format-2" "fmt3-db:format-3"; do
+  fx=${pair%%:*}; label=${pair#*:}
+  [ -d "$(dirname "$0")/fixtures/$fx" ] || continue
+  rm -rf "$W/db-$fx"
+  cp -r "$(dirname "$0")/fixtures/$fx" "$W/db-$fx"
+  chmod -R u+w "$W/db-$fx"
+  out=$($SH "$W/db-$fx" "SELECT count(*) FROM sqlite_master;" 2>&1)
+  expect "$label database opens as empty (see header)" "0" "$out"
   # The bytes are still there: this asserts the fixture is not merely an
   # empty directory, which would make the case above pass for free.
-  n=$(strings "$W"/dbfmt2/*.current 2>/dev/null | grep -c "CREATE TABLE kv")
+  n=$(strings "$W"/db-$fx/*.current 2>/dev/null | grep -c "CREATE TABLE kv")
   expect "...with its schema still on disk, unread" "1" "$n"
+  # A superseded member ALONGSIDE a readable database is a different
+  # question, and there the refusal does surface: the open no longer has
+  # the "nothing here, create" escape.  This is the discriminator that
+  # proves the case above is about the DIRECTORY being empty of readable
+  # members, not about the old format being tolerated.
+  rm -rf "$W/mix-$fx"
+  $SH "$W/mix-$fx" "CREATE TABLE t(a); INSERT INTO t VALUES(42);" >/dev/null 2>&1
+  cp "$(dirname "$0")/fixtures/$fx"/*.current "$W/mix-$fx/"
+  chmod -R u+w "$W/mix-$fx"
+  out=$($SH "$W/mix-$fx" "SELECT * FROM t;" 2>&1)
+  expect "...but beside a readable database it IS an error" "malformed" "$out"
+done
+
+# 4d. THE HAZARD, and the reason "dump and reload" is an instruction to
+#    follow BEFORE upgrading rather than after noticing.  A superseded
+#    database reads as empty (4b/4c) and the bytes survive that read -- but
+#    the first WRITE reuses the same active-file name and TRUNCATES it.  The
+#    old data is not left beside a fresh generation; it is gone.
+#
+#    This is not new at version 4: the format-3 build destroys a format-2
+#    directory the same way (measured 2026-08-27, both arms, 12712 -> ~280
+#    bytes with the same file name).  It went unasserted because the header
+#    of this file, and the doc, both described it as "a fresh generation
+#    beside data still on disk", which is what a NEW uuid would have given.
+#    Asserting it means a future library that starts refusing the whole
+#    open -- the safe behaviour -- fails here and gets noticed.
+if [ -d "$(dirname "$0")/fixtures/fmt2-db" ]; then
+  rm -rf "$W/dbdestroy"
+  cp -r "$(dirname "$0")/fixtures/fmt2-db" "$W/dbdestroy"
+  chmod -R u+w "$W/dbdestroy"
+  before=$(wc -c < "$W"/dbdestroy/*.current | tr -d ' ')
+  # a read alone is safe: it only adds the lock file
+  $SH "$W/dbdestroy" "SELECT count(*) FROM sqlite_master;" >/dev/null 2>&1
+  n=$(strings "$W"/dbdestroy/*.current 2>/dev/null | grep -c "CREATE TABLE kv")
+  expect "a READ leaves the superseded bytes intact" "1" "$n"
+  $SH "$W/dbdestroy" "CREATE TABLE n(x); INSERT INTO n VALUES(7);" >/dev/null 2>&1
+  after=$(wc -c < "$W"/dbdestroy/*.current | tr -d ' ')
+  n=$(strings "$W"/dbdestroy/*.current 2>/dev/null | grep -c "CREATE TABLE kv")
+  expect "a WRITE destroys them (same file name, truncated)" "0" "$n"
+  echo "     (active file $before -> $after bytes)"
 fi
 
 # 5. a database created by THIS build reopens cleanly (the trivial case

@@ -39,7 +39,13 @@ NMID=${NMID:-200000}
 IDXDIR=${IDXDIR:-/tmpfs/zsidx}
 # PHASES lets a phase be re-run on its own -- phase 3 in particular, which
 # needs privilege and so wants an interactive shell for sudo.
-PHASES=${PHASES:-matrix cascade mergemem cached opens latency syscalls fsync}
+# mergemem was here and is DELETED, not disabled: format 4 removed the
+# merge_memory field, so zs_merge_memory is now an unrecognised URI parameter
+# and SQLite ignores it silently.  Left in the list the phase would have run
+# three IDENTICAL arms and printed three overlapping ranges -- a null
+# instrument reading as a clean null result, which is the exact failure mode
+# this file has been bitten by before.
+PHASES=${PHASES:-matrix cascade cached opens latency syscalls fsync}
 has_phase(){ case " $PHASES " in *" $1 "*) return 0;; *) return 1;; esac; }
 
 [ $# -ge 1 ] || { echo "usage: $0 DATASET_MOUNTPOINT [MORE...]" >&2; exit 2; }
@@ -217,65 +223,21 @@ done > "$OUT/cascade.txt" 2>&1
 grep -E "^--|per txn|rewritten|deferred" "$OUT/cascade.txt" | sed 's/^/  /'
 fi
 
-# ------------------------------------------------------------------ mergemem
-if has_phase mergemem; then
-say "phase: merge_memory -- what the A-20 ceiling costs and buys"
-# WHY: library 3.1.0 made a merge hold a 32-byte REFERENCE per record instead
-# of the output bytes, bounded by merge_memory (A-20, default 64MB).  A region
-# that fits is HELD and checksummed in one call; a larger one STREAMS through a
-# 256KB window.  That matters to us twice over: zs_db_compact runs from VACUUM
-# and from a backup finish, and its output is O(DATABASE), so the ceiling is
-# what makes compacting a database bigger than memory possible at all.
+# ---------------------------------------------------------- (no mergemem)
+# The merge_memory sweep lived here and is gone with the field.  What it
+# answered is worth carrying forward as a fact rather than a phase: on ZFS the
+# knob did NOTHING -- every arm overlapped at both recordsizes and both sizes,
+# because a merge there is I/O-bound (4.3-4.5 ms/MB of repack against ~0.5 on
+# APFS) and the CPU-side difference is swamped.  So the deployment answer was
+# "stream, the memory is free", and format 4 makes that unconditional: the
+# pointer array is written after the records, so a merge holds 8 bytes per
+# record in one pass and there is no output to bound.
 #
-# The question this phase settles is whether the DEFAULT is right.  Upstream's
-# justification for 64MB was that holding lets a region be checksummed in one
-# call -- and 3.1.1 removed the streaming checksum's penalty entirely (XXH3's
-# streaming path was 2.5x slower only because XXH3_STREAM_USE_STACK was unset
-# under clang), so that justification is now void.  What holding still buys is
-# one write(2) instead of a few dozen, against up to merge_memory of RSS per
-# merge.  Upstream's "streaming everything costs ~6% of a bulk load" was
-# measured BEFORE that fix and wants redoing; the default may want to go much
-# lower, possibly to always-stream, which would cut peak RSS for free.
-#
-# On the laptop at 2M records the three settings came out 315MB/318MB/619MB of
-# peak RSS for 591-627 / 561-629 / 529-556 ms of merge on 3.1.0.  APFS cannot
-# decide it: the second walk streaming needs re-reads its input, and whether
-# that costs is a ZFS/ARC question.
-#
-# RSS is half the answer and zskvbench reports it itself, from getrusage.
-# The first production run of this phase came back with NO memory figures at
-# all: it leaned on `/usr/bin/time -v`, GNU time is a separate package, and it
-# is not installed on stl-imap-09 -- so the phase silently measured half the
-# question and the whole point of the knob went unrecorded.  A sweep of a
-# memory ceiling must not depend on an optional package.
-for d in "$@"; do
-  for n in "$NMID" "$NBIG"; do
-    # 1 byte = nothing ever fits, so every region streams.  A ceiling nothing
-    # reaches holds every region.  Empty = the library default.  Interleaved
-    # rather than run in a block, and the order rotates, because a fixed order
-    # has manufactured a clean-looking few-percent result before.
-    for pass in 1 2 3; do
-      case $pass in
-        1) order="1 '' 1073741824" ;;
-        2) order="1073741824 1 ''" ;;
-        3) order="'' 1073741824 1" ;;
-      esac
-      for mm in $order; do
-        mm=$(eval echo "$mm")
-        w="$d/mm"; rm -rf "$w"; mkdir -p "$w"
-        echo "-- $d n=$n pass=$pass merge_memory=${mm:-<default 64MB>}"
-        if [ -n "$mm" ]; then
-          ./zskvbench --dir "$w" -n "$n" --reps 1 --rowid --only 1000 \
-            --uri "zs_merge_memory=$mm"
-        else
-          ./zskvbench --dir "$w" -n "$n" --reps 1 --rowid --only 1000
-        fi
-        rm -rf "$w"
-      done
-    done
-  done
-done | tee "$OUT/mergemem.txt"
-fi
+# WHAT REPLACES IT IS A DIFFERENT QUESTION, and it is open.  merge_memory never
+# bounded a merge's MAPPED INPUTS, and those are what made VACUUM peak at
+# 1.2-1.4GB RSS at 2M records.  Format 4 does not obviously change that.  Until
+# someone measures a VACUUM's peak RSS on production under format 4, the
+# compaction memory figure in the doc is a format-3 number.
 
 # --------------------------------------------------------------------- cached
 if has_phase cached; then

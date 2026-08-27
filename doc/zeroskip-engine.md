@@ -1596,6 +1596,17 @@ must alternate direction as well as arms.
 
 #### Format 3 (library 3.0.0): reads up, bulk store down, and the accounting closes
 
+> **FORMAT 3 WAS WITHDRAWN and never released.**  Upstream went from
+> 2.9.2 to format 4 (library 4.0.0, 2026-08-27), skipped the version
+> number so the two layouts can never be confused, and states that
+> version 3 must never be written.  This branch is where the files it
+> refers to came from.  Everything from here to "Format 4" below is
+> **kept as the record, not as a description of the current build** --
+> including the production A/B, which measured a format that no longer
+> exists.  What survives it is method, not numbers: the pairing trap,
+> the KEY-size finding, and the compaction discriminator.  Jump to
+> "Format 4" for what this tree now writes.
+
 An in-order file stopped storing records and started storing
 `[header][pointers][keys][values][trailer]` -- a dense array of key
 entries carrying a pointer into an unframed values region, so a seek
@@ -2315,6 +2326,114 @@ format 3 losing -- because the format-2 arm was answering 271183
 lookups where format 3 answered 500000.  **A vendored benchmark carries
 vendored bugs; pair arms the way upstream paired theirs.**
 
+#### Format 4 (library 4.0.0): what reached us, and what is still open
+
+Upstream withdrew format 3 and released **format 4** from 2.9.2
+instead.  A version-4 build refuses a version-2 or version-3 file at
+open, and there is no migrator: existing data must be dumped and
+reloaded.  Vendored 2026-08-27 at `f7521ee`.
+
+The shape, and why it is not format 3 again.  Both file kinds now hold
+the same self-framing record -- a 4-bit flag nibble, then `keylen` and
+`vallen` (4 bytes of header while `keylen <= 4095` and `vallen <=
+65535`, 16 above that), then `key NUL value NUL`, **packed** rather than
+rounded up to a multiple of 8.  An in-order file is
+`[header][records][pad][pointers][trailer]`, with the pointer array
+*after* the data and a 32-byte trailer naming it.  So format 4 returns
+to format 2's **key/value adjacency**, which is the mechanism that
+matters to us: format 3's measured fetch cost here was one extra
+indirection per lookup, and the deciding variable was KEY size -- the
+shape every SQLite index has.
+
+**The port was again nothing, and the API break upstream flagged was
+not the one that hit us.**  They warned about two changes: `zs_csum`
+returning `uint64_t` (only for a caller supplying an external engine --
+we supply none) and `ZS_NOCSUM` being rejected rather than ignored
+(already deleted here at format 3).  Neither reached the build.  What
+did was **`merge_memory`, removed from `zs_open_data`** -- unmentioned,
+because upstream diffs 4.0.0 against 2.9.2, which never had the field,
+while this tree sat on the unreleased 3.1.x line that did.  The URI
+parameter `zs_merge_memory` is deleted with it, and `prodrun.sh`'s
+`mergemem` phase is deleted rather than disabled: SQLite ignores an
+unrecognised URI parameter silently, so the phase would have run three
+identical arms and printed three overlapping ranges.  **When a vendor
+skips a release line, the API delta that matters is against what YOU
+have, not against what they last shipped.**
+
+The bound merge_memory existed for is now structural: putting the
+pointer array last lets a merge hold 8 bytes per record in a single
+pass, so there is no accumulated output to cap.  That does **not**
+retire the VACUUM memory question -- merge_memory never bounded a
+merge's mapped INPUTS, and those are what made a 2M-record VACUUM peak
+at 1.2-1.4GB.  Until that is re-measured, the compaction memory figures
+above are format-3 numbers.
+
+**On-disk size, measured here and deterministic** (200k records, both
+table shapes, two value sizes; identical file counts in both arms, so
+no cascade confound):
+
+| shape | value | format 2 | format 4 | delta |
+|---|---|---|---|---|
+| rowid | 100B | 26,349,440 | 25,193,516 | **-4.4%** |
+| rowid | 400B | 87,204,048 | 85,204,644 | **-2.3%** |
+| WITHOUT ROWID | 100B | 50,394,416 | 49,194,760 | **-2.4%** |
+| WITHOUT ROWID | 400B | 175,198,640 | 169,199,688 | **-3.4%** |
+
+Upstream's -3.1% holds on our shapes.  This is one of the few results a
+laptop may legitimately decide, because it is bytes rather than time.
+
+**The read comparison is NOT decided here.**  Upstream measured +1.6 to
++2.4% on point lookup and could not resolve scan or store above laptop
+noise; our own history is that format 3 inverted through SQLite at 2M
+on production.  `test/zs/fmt2ab.sh` is retargeted to format 4 and its
+guard now demands magic digits `'1'` and `'4'` (a `'2'` means a stale
+tree -- it is the withdrawn format 3).  One improvement to the
+instrument came free: the two arms now share the **current**
+`src/btree_zs.c`, because removing merge_memory left the old and new
+versions of that file differing only in comments and the deleted
+`zs_nocsum` plumbing, which no run here enters.  Only the library
+moves.  `FMT2_BTREE=1` restores per-arm engine sources if that ever
+stops compiling.
+
+**The read path still verifies nothing**, unchanged in substance from
+format 3: no record carries a checksum, and an in-order file's single
+whole-file checksum is verified only by `zs_db_check_consistency`, by a
+merge reading the file as an input, and by salvage.  One consequence is
+new and is a REDUCTION: because there is now one checksum per file
+rather than one per record, **salvage of an in-order file is all or
+nothing** (S-13) -- a single flipped bit makes every key in that file
+unverifiable, reported once per file as `ZS_SALVAGE_REGION_UNVERIFIED`.
+Version 2 could name the damaged record; version 4 cannot.
+
+**What the format-guard suite says now, and it is not what upstream
+predicted.**  They expected the checked-in format-2 fixture to start
+failing to open.  It does not, and the suite passes unchanged: 4.0.0's
+refusal is per FILE, and `zs_db_open` still skips a member it cannot
+decode.  With every member refused, the directory is indistinguishable
+from an empty one to a caller opening with `ZS_CREATE` -- which is what
+this engine does -- so the caller-visible answer is still an empty
+database.  The guard now proves that is the mechanism rather than
+tolerance, by dropping the same superseded file **beside** a readable
+database, where the open has no "nothing here, create" escape and the
+refusal does surface as `SQLITE_CORRUPT`.  A `fixtures/fmt3-db` fixture
+is checked in alongside `fmt2-db`, because this branch is the only
+place format-3 databases exist.
+
+**And the hazard the doc had backwards.**  The old text said a write
+into a superseded directory "starts a fresh generation beside data
+still on disk".  It does not: the first write **reuses the same
+active-file name and truncates it**.  Measured 2026-08-27 -- the
+format-2 fixture goes 12,712 bytes to 277, with the old schema no
+longer in the file.  A read is safe (it only adds the lock file); the
+first write is not.  This is **not** new at version 4 -- the format-3
+build destroys a format-2 directory identically, so it is a
+mis-description that stood for two format changes, not a regression.
+What it changes is the instruction: "dump and reload" is something to
+do **before** upgrading, not after noticing an empty database, and
+`format-guard.sh` now asserts both halves so a future library that
+refuses the whole open -- the safe behaviour -- fails loudly here.
+
+
 #### Arrival order costs a fixed ~5us per record, on both machines
 
 `zskvbench --random` stores the same key set in a scrambled order (a
@@ -2815,8 +2934,10 @@ on finish) takes point fetches from 190k/s to 372k/s, PAST stock's
 
 **The read path no longer verifies anything, and that is not a knob any
 more** (library 3.0.0).  Records carry no checksum in either file kind
-(F-13a), and an in-order file's two region checksums are verified by
-`zs_db_check_consistency` and by a repack -- never on a read (F-33a).
+(F-13a/F-32), and an in-order file's checksum -- two regions' at format
+3, one over the whole file at format 4 -- is verified by
+`zs_db_check_consistency`, by a merge reading it as an input and by
+salvage, never on a read (F-33a/F-26f).
 Between consistency checks, corrupt bytes in an in-order file are
 returned to us and we hand them to the VDBE.  That is upstream's stated
 trade (F-5e), taken deliberately, and it is a REDUCTION in what this
@@ -2894,12 +3015,23 @@ The engine has NO dependence on zeroskip's on-disk format: it never
 reads a file name, counts files, or knows the layout.  The only
 directory-level code is the recursive delete for ephemeral databases.
 A format change is therefore a re-vendor and a re-verify, not a port.
-**That was an assertion until 2026-08-21 and is now a measurement**:
-library 3.0.0 replaced the whole in-order file layout -- records became
-a dense key array pointing into an unframed values region -- and not one
-line of `btree_zs.c` moved for it.  The single change that did reach us
-came through the API, not the format (`ZS_NOCSUM` was removed, so the
-`zs_nocsum=1` URI parameter went with it).
+**That was an assertion until 2026-08-21 and is now a measurement made
+twice**: library 3.0.0 replaced the whole in-order file layout --
+records became a dense key array pointing into an unframed values
+region -- and library 4.0.0 replaced it again, packing key and value
+back into one self-framing record and moving the pointer array after
+the data.  Not one line of `btree_zs.c` moved for either.  Both times
+the only change that reached us came through the API rather than the
+format: `ZS_NOCSUM` removed at 3.0.0 (so `zs_nocsum=1` went with it),
+`merge_memory` removed at 4.0.0 (so `zs_merge_memory=` went with it).
+
+**Diff the API against what YOU have, not against upstream's last
+release.**  4.0.0's release notes flagged two API changes and neither
+touched this build, while the one that broke the compile went
+unmentioned -- because upstream was diffing against 2.9.2 and this tree
+was on the unreleased 3.1.x line that introduced the field.  The cheap
+check before copying anything: extract every `zs_`/`ZS_` token our
+sources use and grep each one against the incoming header.
 
 What to run, in order: a clean rebuild (`rm -f *.o libsqlite3.a` --
 make cannot see that OPTIONS changed), `zskey-test`, `zsbtree-test`,
@@ -2909,16 +3041,31 @@ the SQL batteries, `format-guard.sh`, `crash-test.sh`, `busy-test.sh`,
 The one thing a format change can break silently is a database written
 by the previous version, and `format-guard.sh` pins the behaviour with
 a checked-in fixture per transition -- `fixtures/oldfmt-db` for the
-pre-2026-08-14 file NAMING, `fixtures/fmt2-db` for the format that
-preceded format 3.  Both open as an EMPTY database rather than failing:
-no error, and a subsequent write starts a fresh generation beside data
-still on disk.  The fmt2 case asserts twice, because "reports zero
-tables" passes for free on an empty directory -- the second assertion
-greps the fixture's `CREATE TABLE` out of the raw file, so the case
-means "declines to read data that is demonstrably present".  Regenerate
-it by building `zskvbench` against the previous library's sources and
-running `--build-only`.  If upstream makes a version mismatch a hard
-error, these expectations flip and should be updated -- deliberately.
+pre-2026-08-14 file NAMING, `fixtures/fmt2-db` for the last format that
+shipped, `fixtures/fmt3-db` for the withdrawn one this branch wrote.
+All three open as an EMPTY database rather than failing, and that has
+survived two format changes including one where upstream expected it to
+flip: the library refuses a foreign file per FILE, and an open with
+`ZS_CREATE` over a directory whose members are all refused cannot tell
+that from an empty directory.  The superseded cases assert **four**
+times each, because "reports zero tables" passes for free on an empty
+directory: that the fixture's `CREATE TABLE` is still greppable out of
+the raw file (so the case means "declines to read data that is
+demonstrably present"), and that the same file **beside** a readable
+database IS an error (so the case is about the directory, not about
+tolerating the old format).
+
+**The write hazard is the case that matters, and it is asserted
+separately.**  A read leaves a superseded database intact; the first
+WRITE reuses the same active-file name and truncates it, so the old
+bytes are gone rather than sitting beside a fresh generation.  Dump and
+reload BEFORE upgrading, not after noticing an empty database.
+
+Regenerate `fmt2-db` by building `zskvbench` against the previous
+library's sources and running `--build-only`; `fmt3-db` was written by
+this tree at `f8027d7a7e` with the SQL in the case.  If upstream ever
+makes a version mismatch fail the whole open -- the safe behaviour --
+these expectations flip and should be updated deliberately.
 
 `ext/zeroskip/VENDOR` records the upstream commit.  To re-vendor: copy
 `zeroskip.c`, `zeroskip.h`, `xxhash.h`, `zsbench.c` from `../zeroskip2`,
