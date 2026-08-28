@@ -13,29 +13,32 @@
 #
 # THREE PHASES, three different questions:
 #
-#   ab       format 2 against format 4 through SQL, reads only.  This is what
-#            upstream asked for.  The laptop said: fetch OVERLAPS in all 12
-#            cells (their +1.6-2.4% is below what the VDBE lets us resolve),
-#            scan is a clean format-4 win in all 12 and it GROWS WITH VALUE
-#            SIZE.  The transfer from laptop to ZFS is precisely what proved
-#            untrustworthy for format 3, which inverted here at 2M.
+#   ab       format 2 against format 4 through SQL, reads only.  ANSWERED on
+#            2026-08-28: format 4 wins all 12 cells on both rows, fetch
+#            +6..79% and scan +3..56%.  Keep running it as the regression
+#            check, and note that the laptop had fetch OVERLAPPING in all 12 --
+#            the laptop-to-ZFS transfer is untrustworthy in BOTH directions,
+#            having hidden a real win here after inventing one for format 3.
 #
-#   attrib   what that scan win IS.  A win proportional to value size is
-#            equally a denser layout and the removal of per-record
-#            verification -- and upstream's own note says verification "pulled
-#            every value byte into cache that the scan would otherwise never
-#            read".  Three arms split it.  Upstream called this comparison
-#            unfinished and unmakeable; it is unmakeable from the format-4
-#            side, but makeable from the format-2 side, which we still have.
-#            THIS IS THE PHASE THAT IS OWED UPSTREAM.
+#   attrib   what that scan win IS.  ANSWERED on 2026-08-28: on SCAN both
+#            halves are real (verification +9..34% where it resolves, layout a
+#            further +1..41%), so quoting format 4's scan gain against format 2
+#            quotes roughly half read-path verification that no longer happens.
+#            On FETCH it is ALL layout -- verification is overlap or +1..3%
+#            everywhere while layout carries +5..28%, and +62..77% at WITHOUT
+#            ROWID/400B/2M.  Upstream called this comparison unmakeable; it is,
+#            from the format-4 side, but not from the format-2 side.
 #
-#   vacuum   the compaction memory question that merge_memory used to own.
-#            Format 4 streams its merge output (the pointer array is written
-#            last), so the field is gone -- but it never bounded a merge's
-#            MAPPED INPUTS, and those are what made a 2M VACUUM peak at
-#            1.2-1.4GB.  zskvbench reports peak RSS itself, so a --vacuum arm
-#            answers it directly.  Also the discriminator for any fetch result:
-#            a per-LOOKUP cost survives collapsing the database to one file.
+#   vacuum   compaction memory, and the per-lookup discriminator.  The first
+#            production run found peak RSS 2-7% BELOW format 2 -- a rounding
+#            error, not a bound -- with a 2M WITHOUT ROWID/400B VACUUM peaking
+#            at 9.6GB.  Upstream fixed that at 9e1a2ac (D-29, both writers
+#            stream), and the LAPTOP now shows -38% / -29%, still near 10GB at
+#            the big cell.  RE-RUNNING THIS PHASE IS THE POINT OF THE NEXT RUN:
+#            how much of the fix lands on ZFS, where the residual is file
+#            mappings rather than allocation.  It stays the fetch discriminator
+#            too -- a per-LOOKUP cost survives collapsing to one file, and the
+#            first run showed the gap WIDENING to +99..103% when it did.
 #
 # Each phase can be run alone: PHASES=attrib ./test/zs/fmt4run.sh /mnt/bench128k
 #

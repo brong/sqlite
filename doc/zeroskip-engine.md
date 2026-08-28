@@ -2519,6 +2519,66 @@ not a format regression, and it is the one number in this run that
 should change how VACUUM is scheduled rather than how it is implemented.
 
 
+##### The merge-memory fix (9e1a2ac): real, ours, and it does not close it
+
+We reported the 9.6GB VACUUM and upstream fixed it, in their words:
+"a compaction held its whole output in memory... the omission was mine:
+format 4 put the pointer array last precisely so this would not be
+necessary, and then neither writer took advantage of it."  Both writers
+now stream into a fixed 256KB sink with an incremental digest, so the
+only per-record state is an 8-byte offset (D-29).  Vendored 2026-08-28.
+
+**Measured here, 2M records through SQL with VACUUM, process peak RSS**
+(one pass per arm -- RSS is deterministic to about 1MB across eight
+passes, unlike anything on the clock):
+
+| shape | value | f7521ee | 9e1a2ac | delta |
+|---|---|---|---|---|
+| rowid | 100B | 2245MB | 1397MB | **-38%** |
+| WITHOUT ROWID | 400B | 13798MB | 9824MB | **-29%** |
+
+A real, large improvement -- and a 2M WITHOUT ROWID VACUUM at 400-byte
+values still peaks near 10GB.  **The scheduling constraint is reduced,
+not removed**, and that is the sentence to carry into deployment.
+
+Upstream's arithmetic says "a 2M-record compaction of 60MB files is
+140MB, being 60 in, 60 out and the 16MB pointer array."  **Do not report
+that as a contradiction of the figures above**: `ru_maxrss` counts
+resident FILE-BACKED pages and their claim is about ALLOCATION -- a
+distinction their own commit draws, since `zstool check` reports 307MB in
+0.02s having touched almost none of the mapping.  Our shape also builds a
+far larger database than their fixture, because a WITHOUT ROWID key IS the
+whole encoded record and the value is that record again.  The honest open
+question is what the residual actually consists of at our shape, and it
+wants the ZFS box and a profile rather than another RSS number.
+
+**No format change, verified rather than assumed.**  The old build and
+the new one each read the other's database, both write magic digit '4',
+the in-order files come out the same size to the byte, and the payload
+between the header and the trailer is byte-identical over 6.3MB -- only
+the per-database UUID and the two checksums covering it differ.  No API
+change either: `zeroskip.h`, `xxhash.h` and `zsbench.c` are byte-identical
+to f7521ee, checked the way the `merge_memory` miss taught us.
+
+**It also carries a concurrency change worth knowing about**: C-1m makes
+a compaction of an already-packed set take the repack lock ALONE, so a
+writer keeps appending for its whole duration.  Plus D-19b (one forward
+history cursor instead of a search per tombstone) and two bugs -- a seal
+that left a straggler mid-set so a later compaction merged nothing and
+returned `ZS_BADFORMAT` for a database merely behind on D-12 (D-25b), and
+a part-written staging file that is now unlinked.  `busy-test`,
+`backup-concurrent` and `twowriter` pass, which is where a lock change
+would surface.
+
+One version note, which is a bookkeeping matter and not a defect: the
+Makefile still says `4.0.0` and the changelog entry was amended in place
+rather than a new version cut, so `4.0.0` names both f7521ee and
+9e1a2ac.  **Nothing ever shipped on 4.0.0**, so no consumer can be
+confused by it.  Where it touches this document is that the two
+production campaigns above are both "format 4" -- and both are keyed by
+commit, with `fmt4run.sh` recording `vendored:` in its `env.txt`, so
+reading the commit rather than the version already resolves it.
+
 #### Arrival order costs a fixed ~5us per record, on both machines
 
 `zskvbench --random` stores the same key set in a scrambled order (a

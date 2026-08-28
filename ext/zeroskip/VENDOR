@@ -1,3 +1,74 @@
+source: 9e1a2ac
+date: 2026-08-28 (still "4.0.0" -- see the version warning below.  THE MERGE
+      MEMORY FIX WE ASKED FOR, plus a locking change and two bugs.  No format
+      change, no API change: verified here, not taken on trust.
+
+      OUR 9.6GB VACUUM MEASUREMENT IS WHAT PROMPTED IT, and upstream says so:
+      "A compaction held its whole output in memory... Downstream measured 9.6GB
+      peak RSS for a 2M-record VACUUM, and the omission was mine: format 4 put
+      the pointer array last precisely so this would not be necessary, and then
+      neither writer took advantage of it."  Both writers now stream through a
+      fixed 256KB sink with an incremental digest, so the only per-record state
+      is an 8-byte offset (D-29).  A growing buffer was rejected deliberately --
+      it would make the footprint a second function of the output.
+
+      MEASURED HERE, AND THE FIX IS REAL BUT DOES NOT CLOSE IT.  2M records
+      through SQL with VACUUM, process peak RSS, one pass per arm (RSS is
+      deterministic to about 1MB across eight passes, so one is enough):
+
+          rowid 100B          2245MB -> 1397MB   (-38%)
+          WITHOUT ROWID 400B  13798MB -> 9824MB  (-29%)
+
+      So a 2M WITHOUT ROWID VACUUM at 400-byte values still peaks near 10GB on
+      this laptop.  Upstream's own arithmetic predicts "a 2M-record compaction
+      of 60MB files is 140MB, being 60 in, 60 out and the 16MB pointer array" --
+      which is nothing like what we see.  THE TWO NUMBERS ARE NOT MEASURING THE
+      SAME THING and the difference should not be reported as a contradiction:
+      ru_maxrss counts resident FILE-BACKED pages, and their figure is about
+      ALLOCATION, which is the distinction their commit draws itself (zstool
+      check reports 307MB in 0.02s having touched almost none of it).  Our shape
+      also makes the database far larger than their fixture: a WITHOUT ROWID
+      key IS the whole encoded record and the value is that record again.
+      What is safe to say downstream: the scheduling constraint on VACUUM is
+      REDUCED, not removed.  Re-measure on the ZFS box before deploying.
+
+      NO FORMAT CHANGE -- VERIFIED AT OUR LAYER, not just asserted.  Upstream
+      says the golden corpus is byte-identical; here, the old build and the new
+      one each read the other's database (50000 rows, same length sum), both
+      write magic digit '4', the in-order files come out the same size to the
+      byte (6300276), and the payload between the header and the trailer is
+      BYTE-IDENTICAL over 6.3MB.  Only the per-database UUID and the two
+      checksums that cover it differ, which is exactly what should differ.
+
+      NO API CHANGE: zeroskip.h, xxhash.h and zsbench.c are byte-identical to
+      f7521ee; only zeroskip.c moved.  Checked the way the merge_memory miss
+      taught us -- every zs_/ZS_ token our sources use, grepped against the
+      incoming header.
+
+      ALSO IN HERE, AND WORTH KNOWING BECAUSE IT IS A CONCURRENCY CHANGE:
+      C-1m, a compaction of an already-packed set now takes the repack lock
+      ALONE, so a concurrent writer keeps appending for its whole duration.
+      D-19b replaces a per-tombstone search with one forward history cursor.
+      And two bugs: zsi_convert_pending was only reachable through a successful
+      active-file conversion, so a seal left a straggler mid-set and a later
+      compaction merged nothing and returned ZS_BADFORMAT for a database that
+      was merely behind on D-12 (D-25b); and a part-written staging file is now
+      unlinked by both writers.  busy-test, backup-concurrent and twowriter all
+      pass, which is where a lock change would show.
+
+      Version note, not a problem: the Makefile still says 4.0.0 and the 4.0.0
+      CHANGELOG entry was amended in place rather than a new version cut, so
+      "4.0.0" names both f7521ee and 9e1a2ac.  Nothing ever shipped on 4.0.0
+      anywhere, so no consumer can be confused by it and there is nothing to
+      raise upstream.  Where it touches US is only this file and the doc, which
+      now hold TWO production campaigns both labelled 4.0.0 -- and both are
+      keyed by commit here, and prodrun/fmt4run record `vendored:` in env.txt,
+      so that is already handled.  Keep quoting the commit, as we do.
+
+      Test tier on this laptop, all green: zskey-test, zsbtree-test, the 10 SQL
+      batteries, format-guard, crash-test 10 rounds, busy-test,
+      backup-concurrent, and the TCL permutation.
+
 source: f7521ee
 date: 2026-08-27 (library 4.0.0 -- FORMAT 4.  An ABI break and an on-disk break.
       A version-4 build refuses a version-2 or version-3 file at open, there is
