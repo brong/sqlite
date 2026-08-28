@@ -63,6 +63,40 @@ date: 2026-08-27 (library 4.0.0 -- FORMAT 4.  An ABI break and an on-disk break.
       "dump and reload" is an instruction to follow BEFORE upgrading, and
       format-guard.sh now asserts both halves.
 
+      PRODUCTION (2026-08-28, stl-imap-09, 128K, 8 passes, guards green --
+      reference cell drifted 4.4%, no cell tripped the instability check):
+      FORMAT 4 WINS ALL 12 CELLS ON BOTH ROWS, fetch +6..79% and scan
+      +3..56%.  The laptop had fetch OVERLAPPING in all 12; the ZFS transfer
+      is untrustworthy in BOTH directions, having hidden a real win here
+      after inventing one for format 3.
+
+      THE SCAN WIN IS CONFOUNDED AND THE FETCH WIN IS NOT -- which is the
+      answer owed upstream, and it corrects what a contaminated laptop run
+      suggested.  Three arms (fmt2 verifying / fmt2 zs_nocsum=1 / fmt4):
+      on SCAN, removed verification is worth +9..34% where it resolves and
+      the LAYOUT a further +1..41%, so BOTH matter and anyone quoting the
+      scan number against format 2 is quoting roughly half read-path
+      verification they no longer do.  On FETCH, verification is overlap or
+      +1..3% everywhere while LAYOUT carries +5..28% -- and +62..77% at
+      WITHOUT ROWID/400B/2M.  A lookup verifies one record, a scan verifies
+      every one.  The ab and attrib phases are independent runs and agree
+      cell by cell on end-to-end fetch.
+
+      COMPACTION WIDENS THE FETCH GAP (VACUUM=1, 2 files in both arms, so no
+      D-14d confound): rowid/100B +7..11%, rowid/400B +20..27%, WITHOUT
+      ROWID/100B +11..14%, WITHOUT ROWID/400B +99..103%.  Per LOOKUP, not
+      per matched file, and the mechanism is NOT attributed -- that wants a
+      profile.  Compaction is still worth +25..33% on fetch for BOTH formats.
+
+      AND FORMAT 4 DOES NOT BOUND A COMPACTION'S MEMORY.  Peak RSS through a
+      2M VACUUM is 2-7% BELOW format 2 -- a rounding error, not a bound:
+      1394->1338MB (rowid/100B), 3718->3632 (rowid/400B), 3261->3029
+      (WITHOUT ROWID/100B), 10400->9604 (WITHOUT ROWID/400B).  Streaming the
+      merge OUTPUT was never the problem; merge_memory never covered the
+      mapped INPUTS and removing it does not either.  A VACUUM of 2M WITHOUT
+      ROWID at 400-byte values peaks at 9.6GB and takes 28-33s.  That is a
+      scheduling constraint, not a format regression.
+
       Test tier on this laptop, all green: zskey-test, zsbtree-test, the 10 SQL
       batteries, format-guard (with the new cases, each mutation-checked),
       crash-test 10 rounds, busy-test, backup-concurrent, twowriter (6),

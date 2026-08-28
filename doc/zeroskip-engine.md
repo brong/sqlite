@@ -2382,10 +2382,11 @@ no cascade confound):
 Upstream's -3.1% holds on our shapes.  This is one of the few results a
 laptop may legitimately decide, because it is bytes rather than time.
 
-**The read comparison is NOT decided here.**  Upstream measured +1.6 to
-+2.4% on point lookup and could not resolve scan or store above laptop
-noise; our own history is that format 3 inverted through SQLite at 2M
-on production.  `test/zs/fmt2ab.sh` is retargeted to format 4 and its
+**The read comparison is NOT decided here** -- it is decided on
+production, two sections below, and the laptop was wrong about it in
+both directions.  Upstream measured +1.6 to +2.4% on point lookup and
+could not resolve scan or store above laptop noise; our own history is
+that format 3 inverted through SQLite at 2M on production.  `test/zs/fmt2ab.sh` is retargeted to format 4 and its
 guard now demands magic digits `'1'` and `'4'` (a `'2'` means a stale
 tree -- it is the withdrawn format 3).  One improvement to the
 instrument came free: the two arms now share the **current**
@@ -2432,6 +2433,90 @@ What it changes is the instruction: "dump and reload" is something to
 do **before** upgrading, not after noticing an empty database, and
 `format-guard.sh` now asserts both halves so a future library that
 refuses the whole open -- the safe behaviour -- fails loudly here.
+
+
+##### Format 4 on production (2026-08-28, stl-imap-09, 128K): it wins everywhere, and the fetch win is the LAYOUT
+
+`test/zs/fmt4run.sh /mnt/bench128k`, 8 passes, arm order alternated,
+guards green (magic digits '1'/'4'; reference cell drifted 4.4%; no cell
+tripped the 1.5x per-arm instability check; load 1.49 at the start and
+1.54 at the end).
+
+**Format 4 is faster in all 12 cells on BOTH rows.**  Fetch +6..79%,
+scan +3..56%.  That is not what the laptop said: there, fetch OVERLAPPED
+in all 12 cells and only scan resolved.  **The laptop-to-ZFS transfer is
+untrustworthy in both directions** -- it hid a real fetch win here,
+having invented a fetch claim for format 3 that inverted.  Two rows
+worth quoting, both at 2M:
+
+| shape | value | fetch fmt2 → fmt4 | scan fmt2 → fmt4 |
+|---|---|---|---|
+| rowid | 100B | 173-175k → 199-203k (+14..17%) | +6..19% |
+| rowid | 400B | 174-178k → 220-223k (+24..28%) | +21..44% |
+| WITHOUT ROWID | 100B | 168-172k → 182-187k (+6..11%) | +26..38% |
+| WITHOUT ROWID | 400B | **95-100k → 166-170k (+66..79%)** | +37..50% |
+
+**THE ATTRIBUTION, AND IT CORRECTS WHAT THE LAPTOP SUGGESTED.**
+`test/zs/scanattrib.sh` splits fmt2-verifying / fmt2-`zs_nocsum=1` /
+fmt4, so the middle-to-right comparison is the layout with verification
+off both sides.  A contaminated single-pass laptop run had put LAYOUT at
+roughly zero and the whole win on removed verification; **on a quiet
+production box that is wrong.**
+
+- **Scan: both matter.**  Verification costs +9..34% where it resolves
+  (and overlaps at rowid/100B, the smallest working set), and the LAYOUT
+  is worth a further +1..41% on top.  So format 4's scan headline is
+  partly a safety net being cashed in and partly a genuinely denser
+  read -- not one or the other.
+- **Fetch: it is ALL layout.**  Verification is overlap or +1..3% in
+  every cell, while LAYOUT carries +5..28% -- and at WITHOUT ROWID/400B/2M,
+  **LAYOUT is +62..77%**.  That is the expected shape: a point lookup
+  verifies one record, a scan verifies every one.
+- The `ab` and `attrib` phases are independent runs and their end-to-end
+  fetch figures agree cell by cell (e.g. rowid/400B/2M: +24..28% in
+  both), which is the cross-check that neither is a fluke.
+
+So the answer owed upstream is: **the scan comparison is confounded by
+the removed verification and the fetch comparison is not.**  Anyone
+quoting format 4's scan number against format 2 is quoting a number that
+is roughly half read-path verification they no longer do.  The fetch
+number is clean and it is bigger than they measured.
+
+**COMPACTION MAKES THE FETCH GAP WIDER, NOT NARROWER** (`VACUUM=1`, file
+counts 2 in both arms, so no D-14d confound at all):
+
+| shape | value | fetch fmt2 | fetch fmt4 | delta |
+|---|---|---|---|---|
+| rowid | 100B | 230-234k | 251-255k | +7..11% |
+| rowid | 400B | 193-198k | 238-245k | +20..27% |
+| WITHOUT ROWID | 100B | 200-203k | 226-229k | +11..14% |
+| WITHOUT ROWID | 400B | 106-107k | 213-215k | **+99..103%** |
+
+A per-matched-FILE cost would mostly vanish when the database collapses
+to one file.  It does the opposite, so this is per LOOKUP and inherent.
+The mechanism is NOT attributed -- that needs a profile, and it is the
+next thing to ask for.  Compaction remains worth +25..33% on fetch for
+BOTH formats (rowid/100B/2M: fmt2 173-175k → 230-234k, fmt4 199-203k →
+250-255k), which replicates D-14d's end-to-end figure and stays the
+argument for routine compaction independently of the format.
+
+**AND THE COMPACTION MEMORY QUESTION IS ANSWERED: FORMAT 4 DOES NOT BOUND
+IT.**  Peak RSS through a VACUUM at 2M, format 2 → format 4:
+
+| shape | value | fmt2 | fmt4 |
+|---|---|---|---|
+| rowid | 100B | 1394-1396MB | 1338-1340MB |
+| rowid | 400B | 3718-3719MB | 3632-3633MB |
+| WITHOUT ROWID | 100B | 3261-3262MB | 3029-3031MB |
+| WITHOUT ROWID | 400B | **10400-10403MB** | **9603-9606MB** |
+
+2-7% below format 2 -- a rounding error, not a bound.  Streaming the
+merge OUTPUT was never the problem: `merge_memory` did not cover a
+merge's mapped INPUTS and neither does removing it.  **A VACUUM of a
+2M-record WITHOUT ROWID table with 400-byte values peaks at 9.6GB and
+takes 28-33s.**  That is a deployment constraint on its own terms, it is
+not a format regression, and it is the one number in this run that
+should change how VACUUM is scheduled rather than how it is implemented.
 
 
 #### Arrival order costs a fixed ~5us per record, on both machines
