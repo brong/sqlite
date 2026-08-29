@@ -2519,38 +2519,58 @@ not a format regression, and it is the one number in this run that
 should change how VACUUM is scheduled rather than how it is implemented.
 
 
-##### The merge-memory fix (9e1a2ac): real, ours, and it does not close it
+##### The merge-memory fix (9e1a2ac): ours, real on a laptop, and worth ~12MB on ZFS
 
-We reported the 9.6GB VACUUM and upstream fixed it, in their words:
-"a compaction held its whole output in memory... the omission was mine:
+We reported the 9.6GB VACUUM and upstream fixed it, in their words: "a
+compaction held its whole output in memory... the omission was mine:
 format 4 put the pointer array last precisely so this would not be
 necessary, and then neither writer took advantage of it."  Both writers
 now stream into a fixed 256KB sink with an incremental digest, so the
 only per-record state is an 8-byte offset (D-29).  Vendored 2026-08-28.
 
-**Measured here, 2M records through SQL with VACUUM, process peak RSS**
-(one pass per arm -- RSS is deterministic to about 1MB across eight
-passes, unlike anything on the clock):
+**On the laptop it looked like the answer.  On production it is not.**
+Peak RSS through a 2M VACUUM, format-4 arm, f7521ee → 9e1a2ac:
 
-| shape | value | f7521ee | 9e1a2ac | delta |
-|---|---|---|---|---|
-| rowid | 100B | 2245MB | 1397MB | **-38%** |
-| WITHOUT ROWID | 400B | 13798MB | 9824MB | **-29%** |
+| shape | value | before | after | delta | |
+|---|---|---|---|---|---|
+| rowid | 100B | 1338-1340MB | 1327-1328MB | −12MB | −0.9% |
+| rowid | 400B | 3632-3633MB | 3620-3622MB | −12MB | −0.3% |
+| WITHOUT ROWID | 100B | 3029-3031MB | 3018-3021MB | −10MB | −0.3% |
+| WITHOUT ROWID | 400B | 9603-9606MB | 9592-9594MB | −12MB | −0.1% |
 
-A real, large improvement -- and a 2M WITHOUT ROWID VACUUM at 400-byte
-values still peaks near 10GB.  **The scheduling constraint is reduced,
-not removed**, and that is the sentence to carry into deployment.
+**A flat ~12MB across four cells spanning 1.3GB to 9.6GB -- a CONSTANT,
+not a proportional saving.**  The same laptop comparison said −38% and
+−29% (rowid/100B 2245→1397MB, WITHOUT ROWID/400B 13798→9824MB).  So the
+deployment sentence is not "reduced, not removed" as the laptop
+suggested; on this box **it is not reduced at all in any way that
+matters, and a 2M WITHOUT ROWID VACUUM at 400-byte values still peaks at
+9.6GB.**
 
-Upstream's arithmetic says "a 2M-record compaction of 60MB files is
-140MB, being 60 in, 60 out and the 16MB pointer array."  **Do not report
-that as a contradiction of the figures above**: `ru_maxrss` counts
-resident FILE-BACKED pages and their claim is about ALLOCATION -- a
-distinction their own commit draws, since `zstool check` reports 307MB in
-0.02s having touched almost none of the mapping.  Our shape also builds a
-far larger database than their fixture, because a WITHOUT ROWID key IS the
-whole encoded record and the value is that record again.  The honest open
-question is what the residual actually consists of at our shape, and it
-wants the ZFS box and a profile rather than another RSS number.
+**The control makes this trustworthy.**  The format-2 arm is the same
+binary in both production runs and reproduces to ±3MB per cell
+(10399-10403MB against 10400-10403 for the big one), so a 12MB move is
+real and 12MB is all it is.  Guards green: reference cell drifted 2.3%,
+no cell tripped the per-arm instability check.  The run finished under
+rising load (0.18 → 4.9 over 5h16m), which is why those two gates matter
+here rather than being ceremony.
+
+**Why, and what to ask upstream for instead.**  Their own commit already
+says the remainder is "file mappings, not allocation", measured on a
+306MB compaction where the allocation was most of the total.  At our
+shape the proportions invert: the allocation they removed was never the
+dominant term, so removing it is invisible.  **If a caller like us is to
+get a bounded VACUUM, the mapped INPUTS are the target, not the output.**
+That is the ask, and it is worth pairing with a profile rather than
+another RSS number -- what the 9.6GB consists of at WITHOUT ROWID/400B is
+still not attributed.
+
+**Third time the laptop has misled this project about ZFS** -- after
+format 3's fetch claim inverting here, and after the laptop hiding
+format 4's real fetch win.  The rule earned by now: **a memory or timing
+figure from the laptop is a hypothesis about production, never a
+finding**, no matter how clean or how deterministic it looks.  RSS is
+deterministic to ~1MB on both machines and that bought nothing, because
+the two machines were not measuring the same dominant term.
 
 **No format change, verified rather than assumed.**  The old build and
 the new one each read the other's database, both write magic digit '4',
@@ -2558,7 +2578,12 @@ the in-order files come out the same size to the byte, and the payload
 between the header and the trailer is byte-identical over 6.3MB -- only
 the per-database UUID and the two checksums covering it differ.  No API
 change either: `zeroskip.h`, `xxhash.h` and `zsbench.c` are byte-identical
-to f7521ee, checked the way the `merge_memory` miss taught us.
+to f7521ee, checked the way the `merge_memory` miss taught us.  **The
+reads confirm it end to end**: `ab`, `attrib` and `vacuum` all reproduce
+the f7521ee run cell by cell (128K rowid/100B/2M fetch +14..17% both
+runs; WITHOUT ROWID/400B/2M fetch +66..80% against +66..79%; the vacuum
+discriminator +96..102% against +99..103%), so the streaming rewrite
+disturbed nothing on the read path.
 
 **It also carries a concurrency change worth knowing about**: C-1m makes
 a compaction of an already-packed set take the repack lock ALONE, so a
@@ -2567,17 +2592,35 @@ history cursor instead of a search per tombstone) and two bugs -- a seal
 that left a straggler mid-set so a later compaction merged nothing and
 returned `ZS_BADFORMAT` for a database merely behind on D-12 (D-25b), and
 a part-written staging file that is now unlinked.  `busy-test`,
-`backup-concurrent` and `twowriter` pass, which is where a lock change
-would surface.
+`backup-concurrent` and `twowriter` pass, but **none of them exercises a
+writer appending through a long compaction on ZFS**, which is exactly
+what C-1m changes.  That is untested here and should be said plainly
+rather than covered by a green tier.
 
-One version note, which is a bookkeeping matter and not a defect: the
-Makefile still says `4.0.0` and the changelog entry was amended in place
-rather than a new version cut, so `4.0.0` names both f7521ee and
-9e1a2ac.  **Nothing ever shipped on 4.0.0**, so no consumer can be
-confused by it.  Where it touches this document is that the two
-production campaigns above are both "format 4" -- and both are keyed by
-commit, with `fmt4run.sh` recording `vendored:` in its `env.txt`, so
-reading the commit rather than the version already resolves it.
+One version note, which is bookkeeping and not a defect: the Makefile
+still says `4.0.0` and the changelog entry was amended in place rather
+than a new version cut, so `4.0.0` names both f7521ee and 9e1a2ac.
+**Nothing ever shipped on 4.0.0**, so no consumer can be confused by it.
+Both production campaigns here are keyed by commit, with `fmt4run.sh`
+recording `vendored:` in its `env.txt`.
+
+##### 4K against 128K, and the first cell where they disagree about the FORMAT
+
+This run swept both datasets.  4K tracks 128K almost everywhere, with one
+exception, at WITHOUT ROWID/400B/2M: **format 2 is faster at 4K than at
+128K there (106-109k against 94-100k) while format 4 is flat (~167k on
+both)**, so the gap narrows from +66..80% to +53..60%.  Compacted it is
++62..71% at 4K against +96..102% at 128K.  Every other cell in the sweep
+has the two recordsizes agreeing to within their ranges.
+
+This is the first result on this branch where recordsize changes a
+FORMAT comparison rather than a zeroskip-versus-btree one, and it is
+narrow: one shape, one value size, the cell where format 2 is weakest.
+It is **not** a deployment argument -- 128K still wins the write side by
+the 26% the matrix records, and that lever is much larger.  Worth knowing
+because it says format 2's deficit in that cell is partly an I/O-shape
+effect that a smaller record size relieves, which is a hint about the
+unattributed mechanism behind the +99..103% compacted gap.
 
 #### Arrival order costs a fixed ~5us per record, on both machines
 

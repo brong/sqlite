@@ -12,25 +12,52 @@ date: 2026-08-28 (still "4.0.0" -- see the version warning below.  THE MERGE
       is an 8-byte offset (D-29).  A growing buffer was rejected deliberately --
       it would make the footprint a second function of the output.
 
-      MEASURED HERE, AND THE FIX IS REAL BUT DOES NOT CLOSE IT.  2M records
-      through SQL with VACUUM, process peak RSS, one pass per arm (RSS is
-      deterministic to about 1MB across eight passes, so one is enough):
+      MEASURED ON PRODUCTION (2026-08-28, stl-imap-09, guards green -- drift
+      2.3%, no instability trip): THE FIX IS WORTH ~12MB AND THAT IS ALL.
+      Peak RSS through a 2M VACUUM, format-4 arm, f7521ee -> 9e1a2ac:
 
-          rowid 100B          2245MB -> 1397MB   (-38%)
-          WITHOUT ROWID 400B  13798MB -> 9824MB  (-29%)
+          rowid 100B          1338-1340 -> 1327-1328MB   -12MB  (-0.9%)
+          rowid 400B          3632-3633 -> 3620-3622MB   -12MB  (-0.3%)
+          WITHOUT ROWID 100B  3029-3031 -> 3018-3021MB   -10MB  (-0.3%)
+          WITHOUT ROWID 400B  9603-9606 -> 9592-9594MB   -12MB  (-0.1%)
 
-      So a 2M WITHOUT ROWID VACUUM at 400-byte values still peaks near 10GB on
-      this laptop.  Upstream's own arithmetic predicts "a 2M-record compaction
-      of 60MB files is 140MB, being 60 in, 60 out and the 16MB pointer array" --
-      which is nothing like what we see.  THE TWO NUMBERS ARE NOT MEASURING THE
-      SAME THING and the difference should not be reported as a contradiction:
-      ru_maxrss counts resident FILE-BACKED pages, and their figure is about
-      ALLOCATION, which is the distinction their commit draws itself (zstool
-      check reports 307MB in 0.02s having touched almost none of it).  Our shape
-      also makes the database far larger than their fixture: a WITHOUT ROWID
-      key IS the whole encoded record and the value is that record again.
-      What is safe to say downstream: the scheduling constraint on VACUUM is
-      REDUCED, not removed.  Re-measure on the ZFS box before deploying.
+      A FLAT CONSTANT across four cells spanning 1.3GB to 9.6GB, not a
+      proportional saving.  The control is that the format-2 arm is the same
+      binary in both production runs and reproduces to +-3MB, so 12MB is real
+      and 12MB is all of it.  A 2M WITHOUT ROWID VACUUM at 400-byte values
+      still peaks at 9.6GB and the deployment constraint is UNCHANGED.
+
+      THE LAPTOP SAID -38% AND -29% (rowid/100B 2245->1397MB, WITHOUT
+      ROWID/400B 13798->9824MB) AND WAS WRONG ABOUT PRODUCTION.  Third time
+      this project has been misled that way -- after format 3's fetch claim
+      inverting here, and after the laptop hiding format 4's real fetch win.
+      RSS is deterministic to ~1MB on both machines and that bought nothing,
+      because the two machines were not measuring the same dominant term.  A
+      laptop memory or timing figure is a HYPOTHESIS about production.
+
+      WHAT TO ASK UPSTREAM FOR INSTEAD.  Their commit already says the
+      remainder is "file mappings, not allocation", measured on a 306MB
+      compaction where the allocation was most of the total.  At our shape the
+      proportions invert, so removing the allocation is invisible.  If a caller
+      like us is to get a bounded VACUUM, THE MAPPED INPUTS ARE THE TARGET, not
+      the output -- and it wants a profile, since what the 9.6GB consists of at
+      WITHOUT ROWID/400B is still unattributed.
+
+      THE READS CONFIRM THE NO-CHANGE CLAIM END TO END: ab, attrib and vacuum
+      all reproduce the f7521ee run cell by cell (128K rowid/100B/2M fetch
+      +14..17% both runs, WITHOUT ROWID/400B/2M fetch +66..80% against +66..79%,
+      the vacuum discriminator +96..102% against +99..103%).
+
+      4K WAS SWEPT TOO and agrees with 128K everywhere except WITHOUT
+      ROWID/400B/2M, where format 2 is faster at 4K (106-109k vs 94-100k) while
+      format 4 is flat, narrowing the gap to +53..60%.  First cell on this
+      branch where recordsize moves a FORMAT comparison.  Not a deployment
+      argument -- 128K still wins the write side by 26%.
+
+      C-1m IS UNTESTED WHERE IT MATTERS: busy-test, backup-concurrent and
+      twowriter all pass, but none of them has a writer appending through a
+      long compaction on ZFS, which is exactly what the lock change alters.
+      Say that plainly rather than letting a green tier imply coverage.
 
       NO FORMAT CHANGE -- VERIFIED AT OUR LAYER, not just asserted.  Upstream
       says the golden corpus is byte-identical; here, the old build and the new
